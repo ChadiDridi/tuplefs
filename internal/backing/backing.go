@@ -58,15 +58,16 @@ func Open(root, uuid string) (*Dir, error) {
 // Root returns the directory path.
 func (d *Dir) Root() string { return d.root }
 
-// Files are spread over 256 subdirectories to keep each one small.
-func (d *Dir) path(ino uint64) string {
+// Path returns where an inode's backing file lives. Files are spread over 256
+// subdirectories to keep each one small.
+func (d *Dir) Path(ino uint64) string {
 	return filepath.Join(d.root, fmt.Sprintf("%02x", ino&0xff), strconv.FormatUint(ino, 10))
 }
 
 // OpenFile opens the backing file of an inode for reading and writing,
 // creating it if this is its first use.
 func (d *Dir) OpenFile(ino uint64) (int, error) {
-	path := d.path(ino)
+	path := d.Path(ino)
 	fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_CREAT|syscall.O_CLOEXEC, 0o600)
 	if err == syscall.ENOENT {
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -89,7 +90,7 @@ type State struct {
 // written has no backing file yet; ok is false and the file is empty.
 func (d *Dir) Stat(ino uint64) (st State, ok bool, err error) {
 	var s syscall.Stat_t
-	if err := syscall.Stat(d.path(ino), &s); err != nil {
+	if err := syscall.Stat(d.Path(ino), &s); err != nil {
 		if err == syscall.ENOENT {
 			return st, false, nil
 		}
@@ -116,20 +117,21 @@ func (d *Dir) SetMtime(ino uint64, mtimeNs int64) error {
 	}
 	syscall.Close(fd)
 	ts := []unix.Timespec{{Nsec: unix.UTIME_OMIT}, unix.NsecToTimespec(mtimeNs)}
-	return unix.UtimesNanoAt(unix.AT_FDCWD, d.path(ino), ts, 0)
+	return unix.UtimesNanoAt(unix.AT_FDCWD, d.Path(ino), ts, 0)
 }
 
 // Remove deletes the backing file of an inode that no longer exists.
 func (d *Dir) Remove(ino uint64) error {
-	err := syscall.Unlink(d.path(ino))
+	err := syscall.Unlink(d.Path(ino))
 	if err == syscall.ENOENT {
 		return nil
 	}
 	return err
 }
 
-// Inodes calls fn for every backing file in the directory.
-func (d *Dir) Inodes(fn func(ino uint64) error) error {
+// Inodes calls fn for every backing file in the directory, with the inode
+// number its name claims and the path it was found at.
+func (d *Dir) Inodes(fn func(ino uint64, path string) error) error {
 	subdirs, err := os.ReadDir(d.root)
 	if err != nil {
 		return err
@@ -147,7 +149,7 @@ func (d *Dir) Inodes(fn func(ino uint64) error) error {
 			if err != nil {
 				return errors.New("unexpected file in data directory: " + filepath.Join(sub.Name(), f.Name()))
 			}
-			if err := fn(ino); err != nil {
+			if err := fn(ino, filepath.Join(d.root, sub.Name(), f.Name())); err != nil {
 				return err
 			}
 		}

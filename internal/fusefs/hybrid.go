@@ -3,6 +3,7 @@ package fusefs
 import (
 	"context"
 	"fmt"
+	"os"
 
 	"github.com/ChadiDridi/tuplefs/internal/backing"
 	"github.com/ChadiDridi/tuplefs/internal/store"
@@ -36,12 +37,13 @@ func Reconcile(ctx context.Context, st *store.Store, dir *backing.Dir) (sizes, r
 	if err := st.UpdateFileStates(ctx, stale); err != nil {
 		return 0, 0, err
 	}
-	err = dir.Inodes(func(ino uint64) error {
-		if exists[ino] {
+	err = dir.Inodes(func(ino uint64, path string) error {
+		if exists[ino] && path == dir.Path(ino) {
 			return nil
 		}
+		// No such inode, or a file that is not where this inode's data lives.
 		removed++
-		return dir.Remove(ino)
+		return os.Remove(path)
 	})
 	return len(stale), removed, err
 }
@@ -69,9 +71,9 @@ func CheckFiles(ctx context.Context, st *store.Store, dir *backing.Dir) ([]store
 			})
 		}
 	}
-	err = dir.Inodes(func(ino uint64) error {
-		if !exists[ino] {
-			problems = append(problems, store.Problem{Check: "backing file without an inode", Detail: fmt.Sprintf("ino %d", ino)})
+	err = dir.Inodes(func(ino uint64, path string) error {
+		if !exists[ino] || path != dir.Path(ino) {
+			problems = append(problems, store.Problem{Check: "backing file without an inode", Detail: path})
 		}
 		return nil
 	})

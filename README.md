@@ -13,7 +13,10 @@ $ cp -r ~/src/project /mnt/data/                    # it is a normal directory
 $ sqlite3 fs.db "SELECT count(*) FROM inodes"       # and a normal database
 ```
 
-It runs on SQLite (one file, no server) or PostgreSQL.
+It runs on SQLite (one file, no server) or PostgreSQL, in one of two layouts:
+
+- **Everything in the database** (default). File contents are rows too, so data and metadata change in the same transaction.
+- **Hybrid** (`mkfs -data files`). Metadata stays in the database; the contents of regular files live in ordinary backing files next to it. Large-file reads and writes then run at the speed of the disk's own file system. See [Two layouts](#two-layouts).
 
 ## Why
 
@@ -31,7 +34,7 @@ What the database gives you here:
 | **Consistent live backups** | `sqlite3 fs.db ".backup snap.db"` or `pg_dump` takes a snapshot of a mounted file system at one point in time. |
 | **Replication and failover** | On PostgreSQL the file system is as available as the database. Promote a replica, mount it there. (This comes from PostgreSQL; this repository does not test failover.) |
 
-What it does **not** give you is speed. See [Performance](#performance): on one machine, a kernel file system is far faster.
+What it does **not** give you is speed on metadata. Creating, listing and deleting files is slower than on a kernel file system in both layouts. Large-file throughput is slow in the default layout and matches ext4 in the hybrid one. See [Performance](#performance).
 
 ## Install
 
@@ -49,6 +52,7 @@ tuplefs mount postgres://user:pass@host/db /mnt/data
 fusermount -u /mnt/data                          # or Ctrl-C in the mount process
 
 tuplefs mkfs -block-size 65536 fs.db             # optional: choose the block size up front
+tuplefs mkfs -data files fs.db                   # hybrid layout: file contents in fs.db.data/
 tuplefs fsck fs.db                               # verify every invariant, read-only, works while mounted
 tuplefs info fs.db
 ```
@@ -58,8 +62,26 @@ Mount flags:
 - `-sync fsync` (default): every operation is atomic and survives a crash of tuplefs, and is forced to disk when a program calls `fsync`. This is what local file systems do.
 - `-sync always`: every operation is forced to disk before it returns.
 - `-allow-other`, `-ro`, `-debug`.
+- `-data-dir DIR`: where the backing files of a hybrid file system are, if not `<database>.data`. Required with PostgreSQL. `mkfs` and `fsck` take it too.
 
 A database can be mounted by one tuplefs process at a time. A second mount is refused.
+
+## Two layouts
+
+The layout is chosen at `mkfs` and recorded in the database.
+
+| | Everything in the database | Hybrid (`-data files`) |
+|---|---|---|
+| Metadata operations (create, rename, unlink, chmod, ...) | One transaction each | One transaction each |
+| File contents | Rows in `blocks` | One backing file per inode in the data directory |
+| A write and its metadata | Atomic together | Not atomic. A write is as crash-safe as the disk's file system makes it, like any ordinary file |
+| Database backup or replication covers | Everything | Metadata only. The data directory needs its own |
+| SQL over file contents | Yes | No. Sizes and names, yes |
+| Large-file throughput | 4 to 13 times slower than ext4 | Same as ext4 with kernel passthrough, up to about 2 times slower without |
+
+In the hybrid layout a backing file is named after its inode number, so `rename` and `link` never touch it. The backing file is the authority on a file's size and modification time. The copies in the `inodes` table, which queries read, are refreshed about once a second, on `fsync` and at unmount. If tuplefs dies, the next mount corrects them from the files on disk and removes backing files whose inode is gone.
+
+**Kernel passthrough.** When the hybrid layout is mounted by root on a kernel with FUSE passthrough, the kernel reads and writes backing files directly and tuplefs is not involved in file I/O at all. CI checks this on Linux 7.0: after a write and a read, the count of I/O requests that reached tuplefs is zero. Mounted by an ordinary user, or on an older kernel such as 6.8, data still goes through tuplefs, one system call per request and no SQL.
 
 ## Query your file system
 
@@ -143,7 +165,7 @@ Read-only queries are always safe, also while mounted. Do not write to the table
 - **Concurrency.** SQLite has one writer, so write transactions queue; readers never wait. On PostgreSQL, transactions run concurrently and each operation first locks the inode rows it depends on (`SELECT ... FOR UPDATE`), the way a kernel file system locks inodes. Directory moves between parents take one extra lock so that two moves cannot build a loop.
 - **Permissions** are enforced by the kernel from the stored mode bits (`default_permissions`).
 
-The file system itself is about 2,100 lines of Go. Journaling, recovery, locking and caching of pages are the database's job.
+The file system itself is about 2,700 lines of Go. Journaling, recovery, locking and caching of pages are the database's job.
 
 ## What is supported
 
@@ -154,25 +176,47 @@ The file system itself is about 2,100 lines of Go. Journaling, recovery, locking
 | Sparse files, `truncate`, `fallocate` (extend, punch hole) | File names that are not valid UTF-8 (rejected with `EILSEQ`, since names are SQL text) |
 | Extended attributes | Updating atime on read (behaves like `noatime`) |
 | Unlink while open, `fsync`, `flock`/`fcntl` locks (handled by the kernel) | Mounting one database from two machines at once |
-| `mmap`, including shared writable mappings | `st_blocks` reflects file size, not allocated blocks |
+| `mmap`, including shared writable mappings | In the default layout, `st_blocks` reflects file size, not allocated blocks |
 
 ## Performance
 
-Measured with [bench/bench.sh](bench/bench.sh) on a laptop (Intel i7-1355U, NVMe, Linux 6.8), default settings, `-sync fsync`. PostgreSQL 17 ran in a container on the same machine with its default configuration.
+Measured with [bench/bench.sh](bench/bench.sh), default settings, `-sync fsync`, SQLite. Each table compares against ext4 on the same machine and disk.
 
-| Workload | ext4 | tuplefs on SQLite | tuplefs on PostgreSQL |
+**GitHub-hosted runner, Linux 7.0, mounted by root, so the hybrid layout uses kernel passthrough.** This is the [benchmark job](.github/workflows/ci.yml) in CI.
+
+| Workload | ext4 | In the database | Hybrid, passthrough |
 |---|---:|---:|---:|
-| Write 256 MiB sequentially, then fsync | 833 MiB/s | 77 MiB/s | 50 MiB/s |
-| Read 256 MiB sequentially | 5,038 MiB/s (page cache) | 340 MiB/s | 64 MiB/s |
-| Overwrite 2,000 × 4 KiB, then fsync | 144,360 /s | 2,527 /s | 342 /s |
-| Create 5,000 files of 4 KiB | 13,703 /s | 767 /s | 198 /s |
-| `ls -l` of 5,000 files | 132,528 /s | 5,775 /s | 1,076 /s |
-| Read 5,000 files | 50,700 /s | 3,065 /s | 582 /s |
-| Delete 5,000 files | 77,112 /s | 1,041 /s | 264 /s |
+| Write 256 MiB sequentially, then fsync | 181 MiB/s | 42 MiB/s | 205 MiB/s |
+| Read 256 MiB sequentially | 9,797 MiB/s | 6,345 MiB/s | 9,027 MiB/s |
+| Overwrite 2,000 × 4 KiB, then fsync | 48,294 /s | 4,503 /s | 5,478 /s |
+| Create 5,000 files of 4 KiB | 1,044 /s | 687 /s | 737 /s |
+| `ls -l` of 5,000 files | 132,119 /s | 9,073 /s | 8,561 /s |
+| Read 5,000 files | 74,679 /s | 6,093 /s | 12,679 /s |
+| Delete 5,000 files | 4,725 /s | 1,135 /s | 1,331 /s |
 
-So on a single machine tuplefs on SQLite is roughly 10 to 75 times slower than ext4, and on PostgreSQL, where every statement also crosses a socket, slower again. Every request crosses from the kernel to a user-space process and becomes a SQL transaction, while ext4 runs in the kernel with its own page cache. This project does not reproduce the claim that a DBMS-backed file system beats the Linux file system. The DBOS paper measured a prototype on VoltDB, a multi-node main-memory DBMS, with in-memory operations only, and calls its own ext4 comparison "apples-to-oranges": with 40 threads its writes matched or beat ext4, while ext4 reads were considerably faster. tuplefs is a different design (FUSE, a disk-based database, one machine), and the numbers above are what that design costs.
+**Laptop (Intel i7-1355U, NVMe), Linux 6.8, mounted by an ordinary user: no passthrough.**
 
-Use tuplefs where the properties matter more than throughput: configuration and state you want transactional and queryable, a file tree you want replicated by your database, or as a readable reference for how a file system maps onto tables.
+| Workload | ext4 | In the database | Hybrid, no passthrough |
+|---|---:|---:|---:|
+| Write 256 MiB sequentially, then fsync | 495 MiB/s | 84 MiB/s | 430 MiB/s |
+| Read 256 MiB sequentially | 4,404 MiB/s | 335 MiB/s | 2,318 MiB/s |
+| Overwrite 2,000 × 4 KiB, then fsync | 140,772 /s | 2,640 /s | 11,283 /s |
+| Create 5,000 files of 4 KiB | 18,220 /s | 738 /s | 1,318 /s |
+| `ls -l` of 5,000 files | 106,380 /s | 9,760 /s | 8,961 /s |
+| Read 5,000 files | 48,770 /s | 5,065 /s | 10,682 /s |
+| Delete 5,000 files | 55,738 /s | 1,540 /s | 1,981 /s |
+
+Sequential reads on ext4, and on the runner, are served from the page cache. Single runs; expect noise of tens of percent. PostgreSQL as the backend is slower than SQLite on one machine, because every statement also crosses a socket: an earlier run of this benchmark in the default layout reached 50 MiB/s for the sequential write and 198 file creates per second.
+
+What the numbers say:
+
+- **Large files.** With passthrough, the hybrid layout reads and writes large files as fast as ext4, because it is ext4 doing the I/O. Without passthrough it is within about a factor of two. The default layout is 4 to 13 times slower, since every write is a SQL transaction.
+- **Metadata.** Creating, listing and deleting files is slower than ext4 in both layouts: from 1.4 times (creates on the runner, where ext4 itself is slow) to 36 times (deletes on the laptop). Each request crosses from the kernel to tuplefs and back, which on the laptop takes about 25 microseconds before any SQL runs, where ext4 needs a few microseconds in total. No database tuning removes that crossing.
+- **Small overwrites followed by fsync** stay slow in both layouts: fsync also commits the database synchronously.
+
+This project does not reproduce the claim that a DBMS-backed file system beats the Linux file system. The DBOS paper measured a prototype on VoltDB, a multi-node main-memory DBMS, with in-memory operations only, and calls its own ext4 comparison "apples-to-oranges": with 40 threads its writes matched or beat ext4, while ext4 reads were considerably faster. tuplefs is a different design (FUSE, a disk-based database, one machine), and the numbers above are what that design costs.
+
+Use the default layout where transactional, queryable, replicated contents matter more than throughput. Use the hybrid layout when you want transactional metadata and SQL over the tree, with ordinary disk speed for the data.
 
 ## Testing
 
@@ -180,7 +224,8 @@ Use tuplefs where the properties matter more than throughput: configuration and 
 - **Mount tests** use a real FUSE mount: permissions, hard links, atomic rename, unlink while open, block-boundary writes, concurrent writers.
 - **Crash test**: `SIGKILL` the tuplefs process while eight writers are busy, then check the database. Every invariant must hold, the fsynced file must be intact, and every file must be either empty or complete, never torn. This covers a crash of tuplefs; surviving power loss relies on the database's own durability.
 - **Real workloads**, run by hand on a mount: `git clone` followed by `git fsck --full`, a tar round trip compared with `diff -r`, and `go build` of a project inside the mount.
-- **POSIX conformance**: CI runs [pjdfstest](https://github.com/pjd/pjdfstest) against a mount as root on every push. All 8,798 tests in its 238 files pass, and `fsck` is clean afterwards.
+- **POSIX conformance**: CI runs [pjdfstest](https://github.com/pjd/pjdfstest) against a mount as root on every push, once per layout. All 8,798 tests in its 238 files pass in both, and `fsck` is clean afterwards.
+- **Both layouts**: the mount tests and the crash test run in each layout, on SQLite and PostgreSQL. One CI job runs them as root with passthrough required and fails if any file I/O reaches tuplefs.
 
 ```sh
 go test ./...                                                   # SQLite; mount tests skip without /dev/fuse
@@ -190,8 +235,9 @@ TUPLEFS_TEST_POSTGRES=postgres://... go test -p 1 ./internal/...  # wipes the tu
 ## Limits
 
 - One mount per database. Sharing a database between machines needs cache invalidation between mounts, which is not implemented.
-- Whole blocks are rewritten: changing one byte rewrites its 32 KiB block row.
-- `statfs` reports a fixed 1 TiB capacity. The real limit is the database's.
+- Default layout: whole blocks are rewritten, so changing one byte rewrites its 32 KiB block row, and `statfs` reports a fixed 1 TiB capacity (the real limit is the database's).
+- Hybrid layout: while mounted, sizes in the `inodes` table can trail the files by about a second. Back up the database and the data directory together, with the file system unmounted or from a snapshot of both.
+- Passthrough needs a mount by root and a kernel that has it. It was verified on Linux 7.0 and is absent on 6.8.
 - Linux only.
 
 ## License
