@@ -34,7 +34,7 @@ What the database gives you here (the last column says what changes in the [hybr
 | **Consistent live backups** | `sqlite3 fs.db ".backup snap.db"` or `pg_dump` takes a snapshot of a mounted file system at one point in time. | The snapshot holds metadata only. Back up the data directory with it, unmounted or from a storage snapshot of both. |
 | **Replication and failover** | On PostgreSQL the file system is as available as the database. Promote a replica, mount it there. (This comes from PostgreSQL; this repository does not test failover.) | Replication covers metadata only. File contents need their own. |
 
-What it does **not** give you is speed on metadata. Creating, listing and deleting files is slower than on a kernel file system in both layouts. Large-file throughput is slow in the default layout and matches ext4 in the hybrid one. See [Performance](#performance).
+What it does **not** give you is speed on metadata. Creating, listing and deleting files is slower than on a kernel file system in both layouts. Large-file throughput is slow in the default layout and comes close to ext4 in the hybrid one with kernel passthrough. See [Performance](#performance).
 
 ## Install
 
@@ -79,7 +79,7 @@ The layout is chosen at `mkfs` and recorded in the database.
 | A write and its metadata | Atomic together | Not atomic. A write is as crash-safe as the disk's file system makes it, like any ordinary file |
 | Database backup or replication covers | Everything | Metadata only. The data directory needs its own |
 | SQL over file contents | Yes | No. Sizes and names, yes |
-| Large-file throughput | 4 to 13 times slower than ext4 | Same as ext4 with kernel passthrough, up to about 2 times slower without |
+| Large-file throughput | 1.9 to 13 times slower than ext4 | 90% to 97% of ext4 with kernel passthrough, 1.8 to 2.6 times slower without |
 
 In the hybrid layout a backing file is named after its inode number, so `rename` and `link` never touch it. The backing file is the authority on a file's size and modification time. The copies in the `inodes` table, which queries read, are refreshed about once a second, on `fsync` and at unmount. If tuplefs dies, the next mount corrects them from the files on disk and removes backing files whose inode is gone.
 
@@ -189,45 +189,59 @@ The file system itself is about 2,700 lines of Go. Journaling, recovery, locking
 
 ## Performance
 
-Measured with [bench/bench.sh](bench/bench.sh), default settings, `-sync fsync`, SQLite. Each table compares against ext4 on the same machine and disk.
+Measured with [bench/bench.sh](bench/bench.sh), default settings, `-sync fsync`, SQLite. Every number is the median of three runs, and each table compares against ext4 on the same machine and disk. Nothing waits for the disk except the two workloads that say fsync.
 
 ![Bar chart of throughput as a percentage of ext4 on the same machine, for the default and hybrid layouts, on the CI runner with passthrough and on the laptop without. The numbers are in the two tables below.](docs/diagrams/benchmark.png)
 
-**GitHub-hosted runner, Linux 7.0, mounted by root, so the hybrid layout uses kernel passthrough.** This is the [benchmark job](.github/workflows/ci.yml) in CI.
+**GitHub-hosted runner, Linux 7.0, mounted by root, so the hybrid layout uses kernel passthrough.** This is the [benchmark job](.github/workflows/ci.yml) in CI, which prints these numbers on every push.
 
 | Workload | ext4 | In the database | Hybrid, passthrough |
 |---|---:|---:|---:|
-| Write 256 MiB sequentially, then fsync | 181 MiB/s | 42 MiB/s | 205 MiB/s |
-| Read 256 MiB sequentially | 9,797 MiB/s | 6,345 MiB/s | 9,027 MiB/s |
-| Overwrite 2,000 × 4 KiB, then fsync | 48,294 /s | 4,503 /s | 5,478 /s |
-| Create 5,000 files of 4 KiB | 1,044 /s | 687 /s | 737 /s |
-| `ls -l` of 5,000 files | 132,119 /s | 9,073 /s | 8,561 /s |
-| Read 5,000 files | 74,679 /s | 6,093 /s | 12,679 /s |
-| Delete 5,000 files | 4,725 /s | 1,135 /s | 1,331 /s |
+| Write 256 MiB sequentially, then fsync | 182 MiB/s | 97 MiB/s | 163 MiB/s |
+| Read 256 MiB sequentially | 7,346 MiB/s | 5,645 MiB/s | 7,125 MiB/s |
+| Overwrite 2,000 × 4 KiB, then fsync | 58,315 /s | 4,515 /s | 13,584 /s |
+| Create 5,000 files of 4 KiB | 9,767 /s | 1,262 /s | 1,485 /s |
+| `ls -l` of 5,000 files | 155,360 /s | 7,684 /s | 7,040 /s |
+| Read 5,000 files | 120,725 /s | 5,686 /s | 10,312 /s |
+| Delete 5,000 files | 105,288 /s | 2,971 /s | 2,501 /s |
 
 **Laptop (Intel i7-1355U, NVMe), Linux 6.8, mounted by an ordinary user, which rules out passthrough.**
 
 | Workload | ext4 | In the database | Hybrid, no passthrough |
 |---|---:|---:|---:|
-| Write 256 MiB sequentially, then fsync | 495 MiB/s | 84 MiB/s | 430 MiB/s |
-| Read 256 MiB sequentially | 4,404 MiB/s | 335 MiB/s | 2,318 MiB/s |
-| Overwrite 2,000 × 4 KiB, then fsync | 140,772 /s | 2,640 /s | 11,283 /s |
-| Create 5,000 files of 4 KiB | 18,220 /s | 738 /s | 1,318 /s |
-| `ls -l` of 5,000 files | 106,380 /s | 9,760 /s | 8,961 /s |
-| Read 5,000 files | 48,770 /s | 5,065 /s | 10,682 /s |
-| Delete 5,000 files | 55,738 /s | 1,540 /s | 1,981 /s |
+| Write 256 MiB sequentially, then fsync | 844 MiB/s | 89 MiB/s | 471 MiB/s |
+| Read 256 MiB sequentially | 5,669 MiB/s | 451 MiB/s | 2,223 MiB/s |
+| Overwrite 2,000 × 4 KiB, then fsync | 92,278 /s | 3,033 /s | 10,966 /s |
+| Create 5,000 files of 4 KiB | 19,964 /s | 723 /s | 1,160 /s |
+| `ls -l` of 5,000 files | 185,154 /s | 6,812 /s | 8,473 /s |
+| Read 5,000 files | 49,309 /s | 3,844 /s | 9,782 /s |
+| Delete 5,000 files | 112,213 /s | 1,614 /s | 1,638 /s |
 
-Sequential reads on ext4, and on the runner, are served from the page cache. Single runs; expect noise of tens of percent. Runners also differ: a later run of the same job landed on a faster disk and measured 538 MiB/s for the ext4 sequential write against 527 MiB/s for the hybrid layout. PostgreSQL as the backend is slower than SQLite on one machine, because every statement also crosses a socket: an earlier run of this benchmark in the default layout reached 50 MiB/s for the sequential write and 198 file creates per second.
+Sequential reads on ext4, and on the runner, are served from the page cache. Runners differ from one job to the next, so compare the columns of one table, not numbers across tables. PostgreSQL as the backend is slower than SQLite on one machine, because every statement also crosses a socket: an earlier single run of this benchmark in the default layout reached 50 MiB/s for the sequential write and 198 file creates per second.
+
+### Is the hybrid layout faster?
+
+For anything that moves file data, yes. For pure metadata it is about the same, and deletes can be a little slower, because each one also removes a backing file. This is the hybrid layout's rate divided by the default layout's, from the tables above (above 1× means hybrid is faster):
+
+| Workload | Runner, with passthrough | Laptop, without |
+|---|---:|---:|
+| Write 256 MiB sequentially, then fsync | 1.7× | 5.3× |
+| Read 256 MiB sequentially | 1.3× | 4.9× |
+| Overwrite 2,000 × 4 KiB, then fsync | 3.0× | 3.6× |
+| Create 5,000 files of 4 KiB | 1.2× | 1.6× |
+| `ls -l` of 5,000 files | 0.9× | 1.2× |
+| Read 5,000 files | 1.8× | 2.5× |
+| Delete 5,000 files | 0.8× | 1.0× |
 
 What the numbers say:
 
-- **Large files.** With passthrough, the hybrid layout reads and writes large files as fast as ext4, because it is ext4 doing the I/O. Without passthrough it is within about a factor of two. The default layout is 4 to 13 times slower, since every write is a SQL transaction.
-- **Metadata.** Creating, listing and deleting files is slower than ext4 in both layouts: from 1.4 times (creates on the runner, where ext4 itself is slow) to 36 times (deletes on the laptop). Each request crosses from the kernel to tuplefs and back, which on the laptop takes about 25 microseconds before any SQL runs, where ext4 needs a few microseconds in total. No database tuning removes that crossing.
-- **Small overwrites followed by fsync** stay slow in both layouts: fsync also commits the database synchronously.
+- **Large files.** With passthrough, the hybrid layout reaches 90% of ext4 on sequential writes and 97% on reads: it is ext4 doing the I/O, plus one database commit at fsync. Without passthrough it is 1.8 to 2.6 times slower than ext4. The default layout is 1.9 to 13 times slower, leaving aside reads served from the page cache, since every write is a SQL transaction.
+- **Metadata.** Creating, listing and deleting files is 6.6 to 70 times slower than ext4, in both layouts. Each request crosses from the kernel to tuplefs and back, which on the laptop takes about 25 microseconds before any SQL runs, where ext4 needs a few microseconds in total. No database tuning removes that crossing.
+- **Small overwrites followed by fsync** are 4.3 to 30 times slower than ext4: fsync also commits the database synchronously.
 
 This project does not reproduce the claim that a DBMS-backed file system beats the Linux file system. The DBOS paper measured a prototype on VoltDB, a multi-node main-memory DBMS, with in-memory operations only, and calls its own ext4 comparison "apples-to-oranges": with 40 threads its writes matched or beat ext4, while ext4 reads were considerably faster. tuplefs is a different design (FUSE, a disk-based database, one machine), and the numbers above are what that design costs.
 
-Use the default layout where transactional, queryable, replicated contents matter more than throughput. Use the hybrid layout when you want transactional metadata and SQL over the tree, with ordinary disk speed for the data.
+Use the default layout where transactional, queryable, replicated contents matter more than throughput. Use the hybrid layout when you want transactional metadata and SQL over the tree, with close to ordinary disk speed for the data.
 
 ## Testing
 
