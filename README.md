@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/ChadiDridi/tuplefs/actions/workflows/ci.yml/badge.svg)](https://github.com/ChadiDridi/tuplefs/actions/workflows/ci.yml)
 
-**A POSIX file system whose entire state lives in a SQL database.** Files, directories and data blocks are rows. Every file system operation is exactly one database transaction. Mount it with FUSE and use it like any other directory; open the same database with `sqlite3` or `psql` and query it like any other tables.
+**A POSIX file system kept in a SQL database.** Files and directories are rows, and by default so are the contents of files. Every metadata operation is exactly one database transaction; in the default layout every write is too. Mount it with FUSE and use it like any other directory; open the same database with `sqlite3` or `psql` and query it like any other tables.
 
 ```console
 $ tuplefs mount fs.db /mnt/data &
@@ -24,15 +24,15 @@ Mike Stonebraker has argued for years that operating system services should be b
 
 tuplefs is a small, working version of the file system half of that idea, so the claim can be tried instead of debated. It is an independent project, not affiliated with DBOS.
 
-What the database gives you here:
+What the database gives you here (the last column says what changes in the [hybrid layout](#two-layouts), where file contents live outside the database):
 
-| | |
-|---|---|
-| **Atomic operations** | `rename`, `write`, `truncate`, `unlink` either happen completely or not at all. There is no window where a rename has removed the old name but not added the new one. |
-| **No journal, no repair** | After a crash the database rolls back the transaction that was in flight. The file system is consistent by construction; `tuplefs fsck` exists to prove that, not to fix anything. |
-| **SQL over your files** | Find the biggest files, total a directory tree, or look for duplicate blocks with a query. No `find`, no walking the tree. |
-| **Consistent live backups** | `sqlite3 fs.db ".backup snap.db"` or `pg_dump` takes a snapshot of a mounted file system at one point in time. |
-| **Replication and failover** | On PostgreSQL the file system is as available as the database. Promote a replica, mount it there. (This comes from PostgreSQL; this repository does not test failover.) |
+| | Default layout | Hybrid layout |
+|---|---|---|
+| **Atomic operations** | `rename`, `write`, `truncate`, `unlink` either happen completely or not at all. There is no window where a rename has removed the old name but not added the new one. | Same for the namespace: `rename`, `link`, `unlink`, `mkdir`, `chmod`. A `write` or `truncate` is not atomic with its metadata. |
+| **No journal, no repair** | After a crash the database rolls back the transaction that was in flight. The file system is consistent by construction; `tuplefs fsck` exists to prove that, not to fix anything. | Same for metadata. The next mount also brings recorded sizes in line with the backing files and removes leftovers. |
+| **SQL over your files** | Find the biggest files, total a directory tree, or look for duplicate blocks with a query. No `find`, no walking the tree. | Same, except for queries over file contents. |
+| **Consistent live backups** | `sqlite3 fs.db ".backup snap.db"` or `pg_dump` takes a snapshot of a mounted file system at one point in time. | The snapshot holds metadata only. Back up the data directory with it, unmounted or from a storage snapshot of both. |
+| **Replication and failover** | On PostgreSQL the file system is as available as the database. Promote a replica, mount it there. (This comes from PostgreSQL; this repository does not test failover.) | Replication covers metadata only. File contents need their own. |
 
 What it does **not** give you is speed on metadata. Creating, listing and deleting files is slower than on a kernel file system in both layouts. Large-file throughput is slow in the default layout and matches ext4 in the hybrid one. See [Performance](#performance).
 
@@ -81,7 +81,7 @@ The layout is chosen at `mkfs` and recorded in the database.
 
 In the hybrid layout a backing file is named after its inode number, so `rename` and `link` never touch it. The backing file is the authority on a file's size and modification time. The copies in the `inodes` table, which queries read, are refreshed about once a second, on `fsync` and at unmount. If tuplefs dies, the next mount corrects them from the files on disk and removes backing files whose inode is gone.
 
-**Kernel passthrough.** When the hybrid layout is mounted by root on a kernel with FUSE passthrough, the kernel reads and writes backing files directly and tuplefs is not involved in file I/O at all. CI checks this on Linux 7.0: after a write and a read, the count of I/O requests that reached tuplefs is zero. Mounted by an ordinary user, or on an older kernel such as 6.8, data still goes through tuplefs, one system call per request and no SQL.
+**Kernel passthrough.** When the hybrid layout is mounted by root on a kernel with FUSE passthrough, the kernel reads and writes backing files directly and tuplefs is not involved in file I/O at all. CI checks this on Linux 7.0: after a write and a read, the count of I/O requests that reached tuplefs is zero. Mounted by an ordinary user, or on a kernel without passthrough, data still goes through tuplefs: one system call per request and no SQL.
 
 ## Query your file system
 
@@ -129,7 +129,7 @@ onprem-lb     143    342418
 LICENSE.copy  1      11358
 ```
 
-Duplicate data blocks, across all files:
+Duplicate data blocks, across all files (default layout, where file contents are rows):
 
 ```sql
 SELECT count(*) AS copies, sum(length(data)) AS wasted_bytes
@@ -158,10 +158,10 @@ Read-only queries are always safe, also while mounted. Do not write to the table
 | `blocks` | one fixed-size piece of a file's data (32 KiB by default) | `(ino, idx)` |
 | `xattrs` | one extended attribute | `(ino, name)` |
 
-- **One operation, one transaction.** `rename` over an existing file removes the old directory entry, repoints the new one, drops the replaced file's link count, deletes its data if that was the last link, and updates both directories' timestamps, all in a single commit.
-- **Sparse files are free.** A block with no row reads as zeros. A 1 GiB file with 4 KiB written to it stores one row.
+- **One metadata operation, one transaction.** `rename` over an existing file removes the old directory entry, repoints the new one, drops the replaced file's link count, deletes its data if that was the last link, and updates both directories' timestamps, all in a single commit.
+- **Sparse files are free.** A block with no row reads as zeros. A 1 GiB file with 4 KiB written to it stores one row. In the hybrid layout, holes are whatever the backing file system makes of them.
 - **Deleting an open file** keeps the inode with a link count of zero until the last handle closes. If tuplefs dies first, the next mount deletes those inodes. That is the only cleanup a mount ever does.
-- **fsync** maps to a synchronous commit, which flushes the database's write-ahead log and with it every earlier commit.
+- **fsync** maps to a synchronous commit, which flushes the database's write-ahead log and with it every earlier commit. In the hybrid layout it first fsyncs the backing file.
 - **Concurrency.** SQLite has one writer, so write transactions queue; readers never wait. On PostgreSQL, transactions run concurrently and each operation first locks the inode rows it depends on (`SELECT ... FOR UPDATE`), the way a kernel file system locks inodes. Directory moves between parents take one extra lock so that two moves cannot build a loop.
 - **Permissions** are enforced by the kernel from the stored mode bits (`default_permissions`).
 
@@ -194,7 +194,7 @@ Measured with [bench/bench.sh](bench/bench.sh), default settings, `-sync fsync`,
 | Read 5,000 files | 74,679 /s | 6,093 /s | 12,679 /s |
 | Delete 5,000 files | 4,725 /s | 1,135 /s | 1,331 /s |
 
-**Laptop (Intel i7-1355U, NVMe), Linux 6.8, mounted by an ordinary user: no passthrough.**
+**Laptop (Intel i7-1355U, NVMe), Linux 6.8, mounted by an ordinary user, which rules out passthrough.**
 
 | Workload | ext4 | In the database | Hybrid, no passthrough |
 |---|---:|---:|---:|
@@ -237,7 +237,7 @@ TUPLEFS_TEST_POSTGRES=postgres://... go test -p 1 ./internal/...  # wipes the tu
 - One mount per database. Sharing a database between machines needs cache invalidation between mounts, which is not implemented.
 - Default layout: whole blocks are rewritten, so changing one byte rewrites its 32 KiB block row, and `statfs` reports a fixed 1 TiB capacity (the real limit is the database's).
 - Hybrid layout: while mounted, sizes in the `inodes` table can trail the files by about a second. Back up the database and the data directory together, with the file system unmounted or from a snapshot of both.
-- Passthrough needs a mount by root and a kernel that has it. It was verified on Linux 7.0 and is absent on 6.8.
+- Passthrough needs a mount by root and a kernel that has it. It was verified on Linux 7.0. The laptop numbers come from an unprivileged mount, where it is not available.
 - Linux only.
 
 ## License

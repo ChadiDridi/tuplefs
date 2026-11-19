@@ -67,13 +67,34 @@ func (d *Dir) Path(ino uint64) string {
 // OpenFile opens the backing file of an inode for reading and writing,
 // creating it if this is its first use.
 func (d *Dir) OpenFile(ino uint64) (int, error) {
+	return d.open(ino, syscall.O_RDWR|syscall.O_CREAT)
+}
+
+// CreateFile opens the backing file of an inode that was just created. It is
+// always empty: if a file is already there, it is the leftover of an earlier
+// inode with the same number and must not leak into the new one.
+func (d *Dir) CreateFile(ino uint64) (int, error) {
+	return d.open(ino, syscall.O_RDWR|syscall.O_CREAT|syscall.O_TRUNC)
+}
+
+// OpenReadOnly opens the backing file of an inode without creating it. A
+// file that was never written has none; ok is false and the file is empty.
+func (d *Dir) OpenReadOnly(ino uint64) (fd int, ok bool, err error) {
+	fd, err = syscall.Open(d.Path(ino), syscall.O_RDONLY|syscall.O_CLOEXEC, 0)
+	if err == syscall.ENOENT {
+		return -1, false, nil
+	}
+	return fd, err == nil, err
+}
+
+func (d *Dir) open(ino uint64, flags int) (int, error) {
 	path := d.Path(ino)
-	fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_CREAT|syscall.O_CLOEXEC, 0o600)
+	fd, err := syscall.Open(path, flags|syscall.O_CLOEXEC, 0o600)
 	if err == syscall.ENOENT {
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			return -1, err
 		}
-		fd, err = syscall.Open(path, syscall.O_RDWR|syscall.O_CREAT|syscall.O_CLOEXEC, 0o600)
+		fd, err = syscall.Open(path, flags|syscall.O_CLOEXEC, 0o600)
 	}
 	return fd, err
 }

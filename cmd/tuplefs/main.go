@@ -112,17 +112,25 @@ func mkfs(ctx context.Context, args []string) error {
 		fmt.Printf("created a %s file system with %d-byte blocks\n", st.Backend(), *blockSize)
 		return nil
 	}
+	// The directory first: if it cannot be used, the database must not be
+	// left formatted for a layout it has no directory for.
 	dir, err := dataDirPath(st, *dataDir)
 	if err != nil {
 		return err
 	}
+	if ok, err := st.Formatted(ctx); err != nil {
+		return err
+	} else if ok {
+		return fmt.Errorf("database already contains a file system")
+	}
+	if opts.UUID, err = store.NewUUID(); err != nil {
+		return err
+	}
+	if _, err := backing.Create(dir, opts.UUID); err != nil {
+		return err
+	}
 	if err := st.FormatWith(ctx, opts); err != nil {
-		return err
-	}
-	if err := st.Load(ctx); err != nil {
-		return err
-	}
-	if _, err := backing.Create(dir, st.UUID()); err != nil {
+		os.RemoveAll(dir) // it holds nothing but the id file written above
 		return err
 	}
 	fmt.Printf("created a %s file system with file contents in %s\n", st.Backend(), dir)
@@ -223,7 +231,13 @@ func mount(ctx context.Context, args []string) error {
 			}
 			log.Printf("last mount did not shut down cleanly: corrected %d recorded sizes, removed %d leftover backing files", sizes, removed)
 		}
+		// The mark must be on disk before any backing file changes. If a
+		// power loss could undo it, the next mount would trust stale sizes
+		// and leftover files.
 		if err := st.SetClean(ctx, false); err != nil {
+			return err
+		}
+		if err := st.Sync(ctx); err != nil {
 			return err
 		}
 	}
@@ -321,7 +335,12 @@ func info(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("backend:     %s\ncreated:     %s\nblock size:  %d\ninodes:      %d (%d directories, %d files)\nfile bytes:  %d\nstored:      %d bytes in data blocks\n",
-		i.Backend, i.Created, i.BlockSize, i.Inodes, i.Dirs, i.Files, i.Bytes, i.Stored)
+	fmt.Printf("backend:     %s\ncreated:     %s\n", i.Backend, i.Created)
+	if st.DataFiles() {
+		fmt.Printf("layout:      hybrid, file contents in backing files\ninodes:      %d (%d directories, %d files)\nfile bytes:  %d (as last recorded)\n", i.Inodes, i.Dirs, i.Files, i.Bytes)
+		return nil
+	}
+	fmt.Printf("layout:      everything in the database\nblock size:  %d\ninodes:      %d (%d directories, %d files)\nfile bytes:  %d\nstored:      %d bytes in data blocks\n",
+		i.BlockSize, i.Inodes, i.Dirs, i.Files, i.Bytes, i.Stored)
 	return nil
 }

@@ -35,8 +35,9 @@ type Options struct {
 
 // FS is a mounted file system.
 type FS struct {
-	st    *store.Store
-	files *backing.Dir // nil unless file contents live in backing files
+	st       *store.Store
+	files    *backing.Dir // nil unless file contents live in backing files
+	readOnly bool
 
 	mu       sync.Mutex
 	open     map[uint64]int      // open handles per inode
@@ -55,7 +56,7 @@ type FS struct {
 // the store. Wait on the returned server to block until it is unmounted, then
 // call FS.Close.
 func Mount(st *store.Store, dir string, opts Options) (*fuse.Server, *FS, error) {
-	fsys := &FS{st: st, files: opts.Data, open: map[uint64]int{}, unlinked: map[uint64]struct{}{}, dirty: map[uint64]struct{}{}}
+	fsys := &FS{st: st, files: opts.Data, readOnly: opts.ReadOnly, open: map[uint64]int{}, unlinked: map[uint64]struct{}{}, dirty: map[uint64]struct{}{}}
 	if fsys.files != nil {
 		// A backing file goes away only after its inode row is gone for good.
 		st.OnDelete(func(ino uint64) {
@@ -324,6 +325,13 @@ func (n *node) mknod(ctx context.Context, name string, mode, rdev uint32, target
 	if err != nil {
 		return nil, a, errno(err)
 	}
+	if n.fsys.fileBacked(a.Mode) {
+		// Inode numbers can come back after a crash that lost commits. A new
+		// file must not inherit what an earlier one left on disk.
+		if err := n.fsys.files.Remove(a.Ino); err != nil {
+			return nil, a, errno(err)
+		}
+	}
 	return n.child(ctx, a, out), a, 0
 }
 
@@ -422,11 +430,17 @@ func (h *handle) PassthroughFd() (int, bool) { return h.fd, h.fd >= 0 }
 func (f *FS) newHandle(ino uint64, mode uint32, writable bool) (*handle, error) {
 	h := &handle{fd: -1, writable: writable}
 	if f.fileBacked(mode) {
-		fd, err := f.files.OpenFile(ino)
+		var err error
+		if f.readOnly {
+			// Never create or change anything. A file without a backing
+			// file is empty, which is also what the database says.
+			h.fd, _, err = f.files.OpenReadOnly(ino)
+		} else {
+			h.fd, err = f.files.OpenFile(ino)
+		}
 		if err != nil {
 			return nil, err
 		}
-		h.fd = fd
 	}
 	f.mu.Lock()
 	f.open[ino]++

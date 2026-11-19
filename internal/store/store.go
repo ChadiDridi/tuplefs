@@ -243,6 +243,18 @@ type FormatOptions struct {
 	// the database. Metadata stays transactional; data is read and written at
 	// the speed of the underlying file system and with its guarantees.
 	DataFiles bool
+	// UUID identifies the file system to its backing directory. The caller
+	// picks it so that the directory can be prepared before the database.
+	UUID string
+}
+
+// NewUUID returns a random identifier for FormatOptions.UUID.
+func NewUUID() (string, error) {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(id[:]), nil
 }
 
 // FormatWith creates an empty file system. It fails if the database already
@@ -284,11 +296,14 @@ func (s *Store) FormatWith(ctx context.Context, o FormatOptions) error {
 			"sync_epoch": "0",
 		}
 		if o.DataFiles {
-			var id [16]byte
-			if _, err := rand.Read(id[:]); err != nil {
-				return err
+			uuid := o.UUID
+			if uuid == "" {
+				var err error
+				if uuid, err = NewUUID(); err != nil {
+					return err
+				}
 			}
-			meta["version"], meta["data"], meta["uuid"], meta["clean"] = schemaVersionFiles, "files", hex.EncodeToString(id[:]), "1"
+			meta["version"], meta["data"], meta["uuid"], meta["clean"] = schemaVersionFiles, "files", uuid, "1"
 		}
 		for k, v := range meta {
 			if _, err := tx.ExecContext(ctx, s.q(`INSERT INTO meta (key, value) VALUES (?, ?)`), k, v); err != nil {

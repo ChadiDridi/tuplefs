@@ -98,6 +98,48 @@ func mountFS(t *testing.T) (string, *store.Store) {
 // mounted maps a test's mount point to its file system.
 var mounted = map[string]*FS{}
 
+// TestNewFileIgnoresLeftoverBackingFile plants a backing file at the path the
+// next inode number will use, as a crash that lost the inode's commit could
+// leave it, and checks that a file created with that number starts empty.
+func TestNewFileIgnoresLeftoverBackingFile(t *testing.T) {
+	if os.Getenv("TUPLEFS_TEST_DATA") != "files" {
+		t.Skip("only the hybrid layout has backing files")
+	}
+	mnt, _ := mountFS(t)
+	write(t, mnt+"/first", "x")
+	st, err := os.Stat(mnt + "/first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := mounted[mnt].files
+	for _, next := range []uint64{st.Sys().(*syscall.Stat_t).Ino + 1, st.Sys().(*syscall.Stat_t).Ino + 2} {
+		path := dir.Path(next)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("contents of a file that no longer exists"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// One created and opened in a single step, one created without opening.
+	f, err := os.Create(mnt + "/created")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if err := syscall.Mknod(mnt+"/mknod", syscall.S_IFREG|0o644, 0); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"created", "mknod"} {
+		if got := read(t, mnt+"/"+name); got != "" {
+			t.Errorf("%s: a new file starts with %q", name, got)
+		}
+		if st, _ := os.Stat(mnt + "/" + name); st.Size() != 0 {
+			t.Errorf("%s: a new file has size %d", name, st.Size())
+		}
+	}
+}
+
 // TestPassthrough checks that, where the kernel can read and write backing
 // files itself, it does: no file data may go through this process. CI runs it
 // as root on a kernel with FUSE passthrough and sets TUPLEFS_REQUIRE_PASSTHROUGH.
