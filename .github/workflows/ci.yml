@@ -140,8 +140,8 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq fuse3
       - name: Run
         run: |
+          set -o pipefail
           go build -o /tmp/tuplefs ./cmd/tuplefs
-          echo user_allow_other | sudo tee -a /etc/fuse.conf
           sudo mkdir -p /bench/local /bench/mnt
           {
             echo "kernel $(uname -r), $(nproc) CPUs, $(df -T /bench | tail -1 | awk '{print $2}')"
@@ -150,8 +150,10 @@ jobs:
             for layout in db files; do
               sudo rm -rf /bench/fs.db*
               sudo /tmp/tuplefs mkfs -data $layout /bench/fs.db >/dev/null
-              sudo /tmp/tuplefs mount /bench/fs.db /bench/mnt 2>/bench/mount.log &
-              for i in $(seq 1 50); do mountpoint -q /bench/mnt && break; sleep 0.2; done
+              sudo sh -c '/tmp/tuplefs mount /bench/fs.db /bench/mnt 2>/tmp/mount.log &'
+              for i in $(seq 1 50); do sudo mountpoint -q /bench/mnt && break; sleep 0.2; done
+              # Refuse to measure anything that is not a tuplefs mount.
+              sudo findmnt -n -o FSTYPE /bench/mnt | grep -qx fuse.tuplefs || { cat /tmp/mount.log; exit 1; }
               echo "===== tuplefs on SQLite, data in $layout, mounted as root"
               sudo bench/bench.sh /bench/mnt
               sudo fusermount3 -u /bench/mnt; sleep 3
