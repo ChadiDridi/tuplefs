@@ -268,6 +268,8 @@ func mount(ctx context.Context, args []string) error {
 		return err
 	}
 	if data != nil {
+		// Zero means the kernel did all file I/O itself (passthrough).
+		log.Printf("file reads and writes served by tuplefs: %d", fsys.ServerIO.Load())
 		if err := st.SetClean(ctx, true); err != nil {
 			return err
 		}

@@ -193,7 +193,7 @@ Measured with [bench/bench.sh](bench/bench.sh), default settings, `-sync fsync`,
 
 ![Bar chart of throughput as a percentage of ext4 on the same machine, for the default and hybrid layouts, on the CI runner with passthrough and on the laptop without. The numbers are in the two tables below.](docs/diagrams/benchmark.png)
 
-**GitHub-hosted runner, Linux 7.0, mounted by root, so the hybrid layout uses kernel passthrough.** This is the [benchmark job](.github/workflows/ci.yml) in CI, which prints these numbers on every push.
+**GitHub-hosted runner, Linux 7.0, mounted by root, so the hybrid layout uses kernel passthrough.** These are from the [benchmark job](.github/workflows/ci.yml) in CI at commit `1654cbe`. The job runs on every push, prints its own numbers, and fails unless the hybrid run did all file I/O through passthrough.
 
 | Workload | ext4 | In the database | Hybrid, passthrough |
 |---|---:|---:|---:|
@@ -205,7 +205,7 @@ Measured with [bench/bench.sh](bench/bench.sh), default settings, `-sync fsync`,
 | Read 5,000 files | 120,725 /s | 5,686 /s | 10,312 /s |
 | Delete 5,000 files | 105,288 /s | 2,971 /s | 2,501 /s |
 
-**Laptop (Intel i7-1355U, NVMe), Linux 6.8, mounted by an ordinary user, which rules out passthrough.**
+**Laptop (Intel i7-1355U, NVMe), Linux 6.8, mounted by an ordinary user, which rules out passthrough.** Measured at the same commit.
 
 | Workload | ext4 | In the database | Hybrid, no passthrough |
 |---|---:|---:|---:|
@@ -267,7 +267,7 @@ TUPLEFS_TEST_POSTGRES=postgres://... go test -p 1 ./internal/...  # wipes the tu
 
 ## Diagrams
 
-The diagrams are [draw.io](https://www.drawio.com) files in [docs/diagrams](docs/diagrams). Edit a `.drawio` file in draw.io and export it again with:
+The diagrams are [draw.io](https://www.drawio.com) files in [docs/diagrams](docs/diagrams). The bars of `benchmark.drawio` are drawn to the numbers in the two tables under [Performance](#performance), so change the chart whenever those tables change. Edit a `.drawio` file in draw.io and export it again with:
 
 ```sh
 drawio -x -f png -s 2 -b 20 --theme light -o docs/diagrams/layouts.png docs/diagrams/layouts.drawio

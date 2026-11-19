@@ -158,6 +158,12 @@ jobs:
               sudo bench/bench.sh /mnt/bench/mnt
               sudo fusermount3 -u /mnt/bench/mnt; sleep 3
               sudo /tmp/tuplefs fsck /mnt/bench/fs.db
+              if [ $layout = files ]; then
+                # The column is labelled "passthrough": refuse to report it
+                # unless the kernel really did all file I/O itself.
+                grep "file reads and writes served by tuplefs" /tmp/mount.log
+                grep -q "served by tuplefs: 0$" /tmp/mount.log
+              fi
             done
           } 2>&1 | tee /tmp/bench.txt
           { echo '```'; cat /tmp/bench.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
