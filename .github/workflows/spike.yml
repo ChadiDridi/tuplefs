@@ -1,0 +1,31 @@
+name: passthrough spike
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  spike:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq fuse3
+      - name: Probe FUSE passthrough
+        run: |
+          uname -r
+          df -T /tmp | tail -1
+          go build -o /tmp/spike ./spike
+          echo user_allow_other | sudo tee -a /etc/fuse.conf
+          mkdir -p /tmp/mnt
+          for who in root user; do
+            echo "=================== mounted as $who"
+            rm -f /tmp/backing /tmp/spike.log; : > /tmp/spike.log; chmod 666 /tmp/spike.log
+            if [ $who = root ]; then sudo /tmp/spike /tmp/mnt /tmp/backing 2>>/tmp/spike.log & else /tmp/spike /tmp/mnt /tmp/backing 2>>/tmp/spike.log & fi
+            for i in $(seq 1 50); do mountpoint -q /tmp/mnt && break; sleep 0.2; done
+            if [ $who = root ]; then sudo python3 spike/probe.py /tmp/mnt /tmp/spike.log; else python3 spike/probe.py /tmp/mnt /tmp/spike.log; fi
+            sleep 0.5
+            echo "------- server log"
+            cat /tmp/spike.log
+            sudo fusermount3 -u /tmp/mnt; sleep 0.5
+          done
