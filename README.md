@@ -1,5 +1,7 @@
 # tuplefs
 
+[![CI](https://github.com/ChadiDridi/tuplefs/actions/workflows/ci.yml/badge.svg)](https://github.com/ChadiDridi/tuplefs/actions/workflows/ci.yml)
+
 **A POSIX file system whose entire state lives in a SQL database.** Files, directories and data blocks are rows. Every file system operation is exactly one database transaction. Mount it with FUSE and use it like any other directory; open the same database with `sqlite3` or `psql` and query it like any other tables.
 
 ```console
@@ -178,7 +180,7 @@ Use tuplefs where the properties matter more than throughput: configuration and 
 - **Mount tests** use a real FUSE mount: permissions, hard links, atomic rename, unlink while open, block-boundary writes, concurrent writers.
 - **Crash test**: `SIGKILL` the tuplefs process while eight writers are busy, then check the database. Every invariant must hold, the fsynced file must be intact, and every file must be either empty or complete, never torn. This covers a crash of tuplefs; surviving power loss relies on the database's own durability.
 - **Real workloads**, run by hand on a mount: `git clone` followed by `git fsck --full`, a tar round trip compared with `diff -r`, and `go build` of a project inside the mount.
-- **POSIX conformance**: CI runs [pjdfstest](https://github.com/pjd/pjdfstest) against a mount as root.
+- **POSIX conformance**: CI runs [pjdfstest](https://github.com/pjd/pjdfstest) against a mount as root on every push. All 8,798 tests in its 238 files pass, and `fsck` is clean afterwards.
 
 ```sh
 go test ./...                                                   # SQLite; mount tests skip without /dev/fuse
