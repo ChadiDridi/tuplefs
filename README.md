@@ -70,6 +70,8 @@ A database can be mounted by one tuplefs process at a time. A second mount is re
 
 The layout is chosen at `mkfs` and recorded in the database.
 
+![The two layouts side by side. Default: every request goes through tuplefs into the database, which also holds file contents. Hybrid: metadata goes to the database, file contents to backing files, and with kernel passthrough data I/O skips tuplefs.](docs/diagrams/layouts.png)
+
 | | Everything in the database | Hybrid (`-data files`) |
 |---|---|---|
 | Metadata operations (create, rename, unlink, chmod, ...) | One transaction each | One transaction each |
@@ -147,9 +149,13 @@ Read-only queries are always safe, also while mounted. Do not write to the table
 
 ## How it works
 
-```text
- application ── syscall ──> kernel VFS ── FUSE ──> tuplefs ── one transaction ──> SQLite / PostgreSQL
-```
+A program makes an ordinary system call. The kernel hands it to tuplefs through FUSE, and tuplefs turns it into SQL.
+
+![Request path: an application's system call goes through the kernel's VFS and FUSE to tuplefs, which runs it as SQL against SQLite or PostgreSQL. sqlite3 or psql can query the same database directly.](docs/diagrams/request-path.png)
+
+The whole file system is four tables. In the hybrid layout `blocks` stays empty, because file contents live in backing files.
+
+![Schema: the tables dirents, inodes, blocks and xattrs with their keys, and the rows that make up the example file /docs/report.txt.](docs/diagrams/schema.png)
 
 | Table | Row | Key |
 |---|---|---|
@@ -158,7 +164,10 @@ Read-only queries are always safe, also while mounted. Do not write to the table
 | `blocks` | one fixed-size piece of a file's data (32 KiB by default) | `(ino, idx)` |
 | `xattrs` | one extended attribute | `(ino, name)` |
 
-- **One metadata operation, one transaction.** `rename` over an existing file removes the old directory entry, repoints the new one, drops the replaced file's link count, deletes its data if that was the last link, and updates both directories' timestamps, all in a single commit.
+- **One metadata operation, one transaction.** `rename` over an existing file removes the old directory entry, repoints the new one, drops the replaced file's link count, deletes its data if that was the last link, and updates both directories' timestamps, all in a single commit:
+
+  ![Rename over an existing file as one transaction: six steps between BEGIN and COMMIT. A crash before COMMIT leaves the state before the rename, and after COMMIT the state after it.](docs/diagrams/rename-transaction.png)
+
 - **Sparse files are free.** A block with no row reads as zeros. A 1 GiB file with 4 KiB written to it stores one row. In the hybrid layout, holes are whatever the backing file system makes of them.
 - **Deleting an open file** keeps the inode with a link count of zero until the last handle closes. If tuplefs dies first, the next mount deletes those inodes. That is the only cleanup a mount ever does.
 - **fsync** maps to a synchronous commit, which flushes the database's write-ahead log and with it every earlier commit. In the hybrid layout it first fsyncs the backing file.
@@ -181,6 +190,8 @@ The file system itself is about 2,700 lines of Go. Journaling, recovery, locking
 ## Performance
 
 Measured with [bench/bench.sh](bench/bench.sh), default settings, `-sync fsync`, SQLite. Each table compares against ext4 on the same machine and disk.
+
+![Bar chart of throughput as a percentage of ext4 on the same machine, for the default and hybrid layouts, on the CI runner with passthrough and on the laptop without. The numbers are in the two tables below.](docs/diagrams/benchmark.png)
 
 **GitHub-hosted runner, Linux 7.0, mounted by root, so the hybrid layout uses kernel passthrough.** This is the [benchmark job](.github/workflows/ci.yml) in CI.
 
@@ -239,6 +250,14 @@ TUPLEFS_TEST_POSTGRES=postgres://... go test -p 1 ./internal/...  # wipes the tu
 - Hybrid layout: while mounted, sizes in the `inodes` table can trail the files by about a second. Back up the database and the data directory together, with the file system unmounted or from a snapshot of both.
 - Passthrough needs a mount by root and a kernel that has it. It was verified on Linux 7.0. The laptop numbers come from an unprivileged mount, where it is not available.
 - Linux only.
+
+## Diagrams
+
+The diagrams are [draw.io](https://www.drawio.com) files in [docs/diagrams](docs/diagrams). Edit a `.drawio` file in draw.io and export it again with:
+
+```sh
+drawio -x -f png -s 2 -b 20 --theme light -o docs/diagrams/layouts.png docs/diagrams/layouts.drawio
+```
 
 ## License
 
