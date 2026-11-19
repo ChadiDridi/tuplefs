@@ -206,7 +206,7 @@ Measured with [bench/bench.sh](bench/bench.sh), default settings, `-sync fsync`,
 | Read 5,000 files | 48,770 /s | 5,065 /s | 10,682 /s |
 | Delete 5,000 files | 55,738 /s | 1,540 /s | 1,981 /s |
 
-Sequential reads on ext4, and on the runner, are served from the page cache. Single runs; expect noise of tens of percent. PostgreSQL as the backend is slower than SQLite on one machine, because every statement also crosses a socket: an earlier run of this benchmark in the default layout reached 50 MiB/s for the sequential write and 198 file creates per second.
+Sequential reads on ext4, and on the runner, are served from the page cache. Single runs; expect noise of tens of percent. Runners also differ: a later run of the same job landed on a faster disk and measured 538 MiB/s for the ext4 sequential write against 527 MiB/s for the hybrid layout. PostgreSQL as the backend is slower than SQLite on one machine, because every statement also crosses a socket: an earlier run of this benchmark in the default layout reached 50 MiB/s for the sequential write and 198 file creates per second.
 
 What the numbers say:
 
