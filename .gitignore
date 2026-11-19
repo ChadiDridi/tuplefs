@@ -1,0 +1,5 @@
+/tuplefs
+*.db
+*.db-wal
+*.db-shm
+*.db.lock
