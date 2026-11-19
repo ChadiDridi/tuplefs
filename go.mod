@@ -1,6 +1,6 @@
 module github.com/ChadiDridi/tuplefs
 
-go 1.27.3
+go 1.26.0
 
 require (
 	github.com/hanwen/go-fuse/v2 v2.12.1

@@ -234,10 +234,33 @@ func (s *Store) Link(ctx context.Context, ino, newParent uint64, newName string)
 	return a, err
 }
 
+// StillOpen is asked, inside the transaction that removes the last name of a
+// file, whether the file is still open. If it is, the inode and its data stay
+// until the caller calls Reap after the last close. A nil StillOpen means no.
+type StillOpen func(ino uint64) bool
+
+// dropIfUnused deletes an inode that just lost its last name, unless it is
+// still open.
+func (s *Store) dropIfUnused(ctx context.Context, tx *sql.Tx, ino uint64, open StillOpen) error {
+	if open != nil && open(ino) {
+		return nil
+	}
+	return s.deleteInode(ctx, tx, ino)
+}
+
+func (s *Store) deleteInode(ctx context.Context, tx *sql.Tx, ino uint64) error {
+	for _, q := range []string{`DELETE FROM blocks WHERE ino = ?`, `DELETE FROM xattrs WHERE ino = ?`, `DELETE FROM inodes WHERE ino = ?`} {
+		if _, err := tx.ExecContext(ctx, s.q(q), int64(ino)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Unlink removes a name that is not a directory. It returns the inode and its
-// remaining link count. When that count is zero the caller must call Reap once
-// nothing has the file open any more.
-func (s *Store) Unlink(ctx context.Context, parent uint64, name string) (ino uint64, nlink uint32, err error) {
+// remaining link count. A file whose count reaches zero is deleted in the same
+// transaction unless open reports that it is still in use.
+func (s *Store) Unlink(ctx context.Context, parent uint64, name string, open StillOpen) (ino uint64, nlink uint32, err error) {
 	err = s.write(ctx, func(tx *sql.Tx) error {
 		if err := s.lock(ctx, tx, parent); err != nil {
 			return err
@@ -262,7 +285,11 @@ func (s *Store) Unlink(ctx context.Context, parent uint64, name string) (ino uin
 		if err := s.addNlink(ctx, tx, ino, -1, now); err != nil {
 			return err
 		}
-		nlink = a.Nlink - 1
+		if nlink = a.Nlink - 1; nlink == 0 {
+			if err := s.dropIfUnused(ctx, tx, ino, open); err != nil {
+				return err
+			}
+		}
 		return s.touch(ctx, tx, parent, now)
 	})
 	return ino, nlink, err
@@ -343,9 +370,9 @@ func (s *Store) isAncestor(ctx context.Context, tx *sql.Tx, anc, ino uint64) (bo
 }
 
 // Rename moves a name, atomically replacing the destination if it exists. If a
-// file was replaced it returns that inode and its remaining link count, with
-// the same Reap contract as Unlink.
-func (s *Store) Rename(ctx context.Context, oldParent uint64, oldName string, newParent uint64, newName string, flags uint32) (replaced uint64, nlink uint32, err error) {
+// file was replaced it returns that inode and its remaining link count; the
+// replaced file is deleted under the same rule as in Unlink.
+func (s *Store) Rename(ctx context.Context, oldParent uint64, oldName string, newParent uint64, newName string, flags uint32, open StillOpen) (replaced uint64, nlink uint32, err error) {
 	if flags&^(RenameNoReplace|RenameExchange) != 0 || flags == RenameNoReplace|RenameExchange {
 		return 0, 0, syscall.EINVAL
 	}
@@ -486,7 +513,11 @@ func (s *Store) Rename(ctx context.Context, oldParent uint64, oldName string, ne
 				if err := s.addNlink(ctx, tx, dstIno, -1, now); err != nil {
 					return err
 				}
-				replaced, nlink = dstIno, dst.Nlink-1
+				if replaced, nlink = dstIno, dst.Nlink-1; nlink == 0 {
+					if err := s.dropIfUnused(ctx, tx, dstIno, open); err != nil {
+						return err
+					}
+				}
 			}
 			if err := setDirent(newParent, newName, srcIno); err != nil {
 				return err
@@ -618,7 +649,7 @@ func (s *Store) SetAttr(ctx context.Context, ino uint64, req SetAttrReq) (a Attr
 }
 
 // Reap deletes an inode and its data if it has no names left. Call it when the
-// last open handle of an unlinked file is closed.
+// last open handle of a file that was unlinked while open is closed.
 func (s *Store) Reap(ctx context.Context, ino uint64) error {
 	return s.write(ctx, func(tx *sql.Tx) error {
 		if err := s.lock(ctx, tx, ino); err != nil {
@@ -631,12 +662,7 @@ func (s *Store) Reap(ctx context.Context, ino uint64) error {
 		if err != nil || a.Nlink != 0 {
 			return err
 		}
-		for _, q := range []string{`DELETE FROM blocks WHERE ino = ?`, `DELETE FROM xattrs WHERE ino = ?`, `DELETE FROM inodes WHERE ino = ?`} {
-			if _, err := tx.ExecContext(ctx, s.q(q), int64(ino)); err != nil {
-				return err
-			}
-		}
-		return nil
+		return s.deleteInode(ctx, tx, ino)
 	})
 }
 

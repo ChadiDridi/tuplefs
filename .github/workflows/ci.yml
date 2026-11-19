@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (SQLite, real FUSE mounts)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install FUSE
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fuse3
+      - name: Format and vet
+        run: |
+          test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+          go vet ./...
+      - name: Test
+        env:
+          TUPLEFS_REQUIRE_FUSE: "1" # fail, do not skip, if a mount is impossible
+        run: go test -race ./...
+
+  postgres:
+    name: test (PostgreSQL)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: tuplefs
+          POSTGRES_DB: tuplefs
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install FUSE
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fuse3
+      - name: Test
+        env:
+          TUPLEFS_REQUIRE_FUSE: "1"
+          TUPLEFS_TEST_POSTGRES: postgres://postgres:tuplefs@127.0.0.1:5432/tuplefs?sslmode=disable
+        run: go test -p 1 ./internal/...
+
+  conformance:
+    name: POSIX conformance (pjdfstest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install FUSE and build tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fuse3 autoconf automake build-essential
+      - name: Build pjdfstest
+        run: |
+          git clone --depth 1 https://github.com/pjd/pjdfstest /tmp/pjdfstest
+          cd /tmp/pjdfstest && autoreconf -ifs && ./configure && make pjdfstest
+      - name: Mount tuplefs as root
+        run: |
+          go build -o /tmp/tuplefs ./cmd/tuplefs
+          echo user_allow_other | sudo tee -a /etc/fuse.conf
+          sudo mkdir -p /mnt/tuplefs
+          sudo /tmp/tuplefs mkfs /tmp/fs.db
+          sudo /tmp/tuplefs mount -allow-other /tmp/fs.db /mnt/tuplefs &
+          for i in $(seq 1 50); do mountpoint -q /mnt/tuplefs && break; sleep 0.2; done
+          mountpoint /mnt/tuplefs
+      - name: Run pjdfstest
+        run: |
+          cd /mnt/tuplefs
+          sudo prove -r /tmp/pjdfstest/tests 2>&1 | tee /tmp/pjdfstest.log | tail -n 80
+          {
+            echo '### pjdfstest'
+            echo '```'
+            tail -n 40 /tmp/pjdfstest.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          grep -q '^Result: PASS' /tmp/pjdfstest.log
+      - name: Check the file system afterwards
+        if: always()
+        run: |
+          sudo fusermount3 -u /mnt/tuplefs
+          sleep 1
+          sudo /tmp/tuplefs fsck /tmp/fs.db

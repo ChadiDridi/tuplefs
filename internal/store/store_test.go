@@ -136,10 +136,11 @@ func TestLinkUnlinkReap(t *testing.T) {
 	_, err = s.Link(ctx, RootIno, RootIno, "rootlink")
 	wantErrno(t, err, syscall.EPERM)
 
-	if _, n, err := s.Unlink(ctx, RootIno, "a"); err != nil || n != 1 {
+	stillOpen := func(uint64) bool { return true }
+	if _, n, err := s.Unlink(ctx, RootIno, "a", stillOpen); err != nil || n != 1 {
 		t.Fatalf("unlink a: nlink %d, %v", n, err)
 	}
-	ino, n, err := s.Unlink(ctx, RootIno, "b")
+	ino, n, err := s.Unlink(ctx, RootIno, "b", stillOpen)
 	if err != nil || n != 0 || ino != f.Ino {
 		t.Fatalf("unlink b: ino %d nlink %d, %v", ino, n, err)
 	}
@@ -170,7 +171,7 @@ func TestReapOrphansAfterCrash(t *testing.T) {
 		s.Write(ctx, f.Ino, 0, make([]byte, 10000))
 		s.SetXattr(ctx, f.Ino, "user.k", []byte("v"), 0)
 	}
-	s.Unlink(ctx, RootIno, "a") // "crash" before Reap
+	s.Unlink(ctx, RootIno, "a", func(uint64) bool { return true }) // open at the "crash"
 	n, err := s.ReapOrphans(ctx)
 	if err != nil || n != 1 {
 		t.Fatalf("ReapOrphans = %d, %v", n, err)
@@ -187,9 +188,9 @@ func TestRmdir(t *testing.T) {
 	mk(t, s, d.Ino, "f", syscall.S_IFREG|0o644)
 	wantErrno(t, s.Rmdir(ctx, RootIno, "d"), syscall.ENOTEMPTY)
 	wantErrno(t, s.Rmdir(ctx, d.Ino, "f"), syscall.ENOTDIR)
-	_, _, err := s.Unlink(ctx, RootIno, "d")
+	_, _, err := s.Unlink(ctx, RootIno, "d", nil)
 	wantErrno(t, err, syscall.EISDIR)
-	s.Unlink(ctx, d.Ino, "f")
+	s.Unlink(ctx, d.Ino, "f", nil)
 	if err := s.Rmdir(ctx, RootIno, "d"); err != nil {
 		t.Fatal(err)
 	}
@@ -211,33 +212,35 @@ func TestRename(t *testing.T) {
 	sub := mk(t, s, a.Ino, "sub", syscall.S_IFDIR|0o755)
 
 	// Plain move across directories.
-	if _, _, err := s.Rename(ctx, a.Ino, "f", b.Ino, "f2", 0); err != nil {
+	if _, _, err := s.Rename(ctx, a.Ino, "f", b.Ino, "f2", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := s.Lookup(ctx, b.Ino, "f2"); err != nil || got.Ino != f.Ino {
 		t.Fatalf("after move: %+v, %v", got, err)
 	}
 	// Replace an existing file: the old inode loses its last link.
-	replaced, nlink, err := s.Rename(ctx, b.Ino, "f2", b.Ino, "g", 0)
+	replaced, nlink, err := s.Rename(ctx, b.Ino, "f2", b.Ino, "g", 0, nil)
 	if err != nil || replaced != g.Ino || nlink != 0 {
 		t.Fatalf("replace: replaced %d nlink %d, %v", replaced, nlink, err)
 	}
-	s.Reap(ctx, replaced)
+	if _, err := s.GetAttr(ctx, replaced); err != syscall.ENOENT {
+		t.Fatalf("replaced file should be gone, got %v", err)
+	}
 	// NOREPLACE.
 	mk(t, s, b.Ino, "h", syscall.S_IFREG|0o644)
-	_, _, err = s.Rename(ctx, b.Ino, "g", b.Ino, "h", RenameNoReplace)
+	_, _, err = s.Rename(ctx, b.Ino, "g", b.Ino, "h", RenameNoReplace, nil)
 	wantErrno(t, err, syscall.EEXIST)
 	// Type mismatches.
-	_, _, err = s.Rename(ctx, b.Ino, "g", a.Ino, "sub", 0)
+	_, _, err = s.Rename(ctx, b.Ino, "g", a.Ino, "sub", 0, nil)
 	wantErrno(t, err, syscall.EISDIR)
-	_, _, err = s.Rename(ctx, a.Ino, "sub", b.Ino, "g", 0)
+	_, _, err = s.Rename(ctx, a.Ino, "sub", b.Ino, "g", 0, nil)
 	wantErrno(t, err, syscall.ENOTDIR)
 	// A directory cannot move into its own subtree.
 	deep := mk(t, s, sub.Ino, "deep", syscall.S_IFDIR|0o755)
-	_, _, err = s.Rename(ctx, RootIno, "a", deep.Ino, "a", 0)
+	_, _, err = s.Rename(ctx, RootIno, "a", deep.Ino, "a", 0, nil)
 	wantErrno(t, err, syscall.EINVAL)
 	// Moving a directory updates both parents' link counts.
-	if _, _, err := s.Rename(ctx, a.Ino, "sub", b.Ino, "sub", 0); err != nil {
+	if _, _, err := s.Rename(ctx, a.Ino, "sub", b.Ino, "sub", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	aAttr, _ := s.GetAttr(ctx, a.Ino)
@@ -247,13 +250,13 @@ func TestRename(t *testing.T) {
 	}
 	// Directory over a non-empty directory fails, over an empty one works.
 	mk(t, s, RootIno, "c", syscall.S_IFDIR|0o755)
-	_, _, err = s.Rename(ctx, RootIno, "c", RootIno, "b", 0)
+	_, _, err = s.Rename(ctx, RootIno, "c", RootIno, "b", 0, nil)
 	wantErrno(t, err, syscall.ENOTEMPTY)
-	if _, _, err := s.Rename(ctx, RootIno, "c", RootIno, "a", 0); err != nil {
+	if _, _, err := s.Rename(ctx, RootIno, "c", RootIno, "a", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	// Exchange a file and a directory in different parents.
-	if _, _, err := s.Rename(ctx, b.Ino, "g", RootIno, "a", RenameExchange); err != nil {
+	if _, _, err := s.Rename(ctx, b.Ino, "g", RootIno, "a", RenameExchange, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := s.Lookup(ctx, RootIno, "a"); got.Ino != f.Ino {
@@ -262,11 +265,11 @@ func TestRename(t *testing.T) {
 	if got, _ := s.Lookup(ctx, b.Ino, "g"); !got.IsDir() {
 		t.Fatal("exchange: b/g should now be a directory")
 	}
-	_, _, err = s.Rename(ctx, RootIno, "a", RootIno, "nope", RenameExchange)
+	_, _, err = s.Rename(ctx, RootIno, "a", RootIno, "nope", RenameExchange, nil)
 	wantErrno(t, err, syscall.ENOENT)
 	// Renaming one hard link over another of the same file does nothing.
 	s.Link(ctx, f.Ino, RootIno, "alias")
-	if _, _, err := s.Rename(ctx, RootIno, "a", RootIno, "alias", 0); err != nil {
+	if _, _, err := s.Rename(ctx, RootIno, "a", RootIno, "alias", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := s.GetAttr(ctx, f.Ino); got.Nlink != 2 {
@@ -521,11 +524,7 @@ func TestConcurrentNamespaceStress(t *testing.T) {
 						}
 					}
 				case 3:
-					var ino uint64
-					var nlink uint32
-					if ino, nlink, err = s.Unlink(ctx, pickDir(rng), name()); err == nil && nlink == 0 {
-						err = s.Reap(ctx, ino)
-					}
+					_, _, err = s.Unlink(ctx, pickDir(rng), name(), nil)
 				case 4:
 					err = s.Rmdir(ctx, pickDir(rng), name())
 				case 5:
@@ -535,11 +534,7 @@ func TestConcurrentNamespaceStress(t *testing.T) {
 					}
 				default:
 					flags := []uint32{0, 0, RenameNoReplace, RenameExchange}[rng.Intn(4)]
-					var replaced uint64
-					var nlink uint32
-					if replaced, nlink, err = s.Rename(ctx, pickDir(rng), name(), pickDir(rng), name(), flags); err == nil && replaced != 0 && nlink == 0 {
-						err = s.Reap(ctx, replaced)
-					}
+					_, _, err = s.Rename(ctx, pickDir(rng), name(), pickDir(rng), name(), flags, nil)
 				}
 				var e syscall.Errno
 				if err != nil && !errors.As(err, &e) {
@@ -572,8 +567,8 @@ func TestOpposingDirectoryMovesNeverMakeLoop(t *testing.T) {
 		errs := make([]error, 2)
 		start := make(chan struct{})
 		wg.Add(2)
-		go func() { defer wg.Done(); <-start; _, _, errs[0] = s.Rename(ctx, x.Ino, "A", inB.Ino, "A", 0) }()
-		go func() { defer wg.Done(); <-start; _, _, errs[1] = s.Rename(ctx, y.Ino, "B", inA.Ino, "B", 0) }()
+		go func() { defer wg.Done(); <-start; _, _, errs[0] = s.Rename(ctx, x.Ino, "A", inB.Ino, "A", 0, nil) }()
+		go func() { defer wg.Done(); <-start; _, _, errs[1] = s.Rename(ctx, y.Ino, "B", inA.Ino, "B", 0, nil) }()
 		close(start)
 		wg.Wait()
 		if errs[0] == nil && errs[1] == nil {

@@ -32,14 +32,15 @@ type Options struct {
 type FS struct {
 	st *store.Store
 
-	mu   sync.Mutex
-	open map[uint64]int // open handles per inode
+	mu       sync.Mutex
+	open     map[uint64]int      // open handles per inode
+	unlinked map[uint64]struct{} // open inodes that lost their last name
 }
 
 // Mount mounts the file system held in st at dir. The caller must have loaded
 // the store. Wait on the returned server to block until it is unmounted.
 func Mount(st *store.Store, dir string, opts Options) (*fuse.Server, error) {
-	fsys := &FS{st: st, open: map[uint64]int{}}
+	fsys := &FS{st: st, open: map[uint64]int{}, unlinked: map[uint64]struct{}{}}
 	// One process owns the database (see Store.LockMount), so every change
 	// goes through this mount and the kernel may cache what it is told.
 	timeout := time.Second
@@ -242,14 +243,8 @@ func (n *node) Link(ctx context.Context, target fs.InodeEmbedder, name string, o
 }
 
 func (n *node) Unlink(ctx context.Context, name string) syscall.Errno {
-	ino, nlink, err := n.fsys.st.Unlink(bg(ctx), n.ino(), name)
-	if err != nil {
-		return errno(err)
-	}
-	if nlink == 0 {
-		n.fsys.reapIfClosed(bg(ctx), ino)
-	}
-	return 0
+	_, _, err := n.fsys.st.Unlink(bg(ctx), n.ino(), name, n.fsys.stillOpen)
+	return errno(err)
 }
 
 func (n *node) Rmdir(ctx context.Context, name string) syscall.Errno {
@@ -257,14 +252,8 @@ func (n *node) Rmdir(ctx context.Context, name string) syscall.Errno {
 }
 
 func (n *node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
-	replaced, nlink, err := n.fsys.st.Rename(bg(ctx), n.ino(), name, newParent.EmbeddedInode().StableAttr().Ino, newName, flags)
-	if err != nil {
-		return errno(err)
-	}
-	if replaced != 0 && nlink == 0 {
-		n.fsys.reapIfClosed(bg(ctx), replaced)
-	}
-	return 0
+	_, _, err := n.fsys.st.Rename(bg(ctx), n.ino(), name, newParent.EmbeddedInode().StableAttr().Ino, newName, flags, n.fsys.stillOpen)
+	return errno(err)
 }
 
 func (n *node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
@@ -297,17 +286,17 @@ func (f *FS) opened(ino uint64) {
 	f.mu.Unlock()
 }
 
-// reapIfClosed deletes an inode that lost its last name, unless a handle still
-// has it open. In that case the last Release deletes it.
-func (f *FS) reapIfClosed(ctx context.Context, ino uint64) {
+// stillOpen is called by the store when a file loses its last name. If a
+// handle still has the file open, the store keeps its data and the last
+// Release deletes it.
+func (f *FS) stillOpen(ino uint64) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.open[ino] > 0 {
-		return
+	if f.open[ino] == 0 {
+		return false
 	}
-	if err := f.st.Reap(ctx, ino); err != nil {
-		log.Printf("tuplefs: reclaiming inode %d: %v (the next mount will retry)", ino, err)
-	}
+	f.unlinked[ino] = struct{}{}
+	return true
 }
 
 func (n *node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
@@ -324,14 +313,19 @@ func (n *node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 func (n *node) Release(ctx context.Context, _ fs.FileHandle) syscall.Errno {
 	f, ino := n.fsys, n.ino()
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.open[ino]--; f.open[ino] > 0 {
-		return 0
+	f.open[ino]--
+	last := f.open[ino] <= 0
+	_, reap := f.unlinked[ino]
+	if last {
+		delete(f.open, ino)
+		delete(f.unlinked, ino)
 	}
-	delete(f.open, ino)
-	// Last handle gone: if the file was unlinked meanwhile, drop its data now.
-	if err := f.st.Reap(bg(ctx), ino); err != nil {
-		log.Printf("tuplefs: reclaiming inode %d: %v (the next mount will retry)", ino, err)
+	f.mu.Unlock()
+	if last && reap {
+		// The file was unlinked while open and this was the last handle.
+		if err := f.st.Reap(bg(ctx), ino); err != nil {
+			log.Printf("tuplefs: reclaiming inode %d: %v (the next mount will retry)", ino, err)
+		}
 	}
 	return 0
 }

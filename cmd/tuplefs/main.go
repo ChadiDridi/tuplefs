@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -152,7 +153,7 @@ func mount(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	log.Printf("%s mounted on %s (%s backend, sync=%s)", rest[0], rest[1], st.Backend(), *syncMode)
+	log.Printf("%s mounted on %s (%s backend, sync=%s)", redact(rest[0]), rest[1], st.Backend(), *syncMode)
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -164,6 +165,14 @@ func mount(ctx context.Context, args []string) error {
 	}()
 	server.Wait()
 	return st.Sync(ctx)
+}
+
+// redact hides the password of a database URL in log output.
+func redact(dsn string) string {
+	if u, err := url.Parse(dsn); err == nil && u.User != nil {
+		return u.Redacted()
+	}
+	return dsn
 }
 
 func fsck(ctx context.Context, args []string) error {

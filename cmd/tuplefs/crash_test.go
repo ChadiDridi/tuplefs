@@ -18,14 +18,14 @@ import (
 func fusermount(t *testing.T) string {
 	t.Helper()
 	if _, err := os.Stat("/dev/fuse"); err != nil {
-		t.Skip("no /dev/fuse")
+		skip(t, "no /dev/fuse")
 	}
 	for _, name := range []string{"fusermount3", "fusermount"} {
 		if path, err := exec.LookPath(name); err == nil {
 			return path
 		}
 	}
-	t.Skip("no fusermount")
+	skip(t, "no fusermount")
 	return ""
 }
 
@@ -48,7 +48,7 @@ func startMount(t *testing.T, bin, db, mnt string) *exec.Cmd {
 		}
 	}
 	cmd.Process.Kill()
-	t.Skip("mount did not come up (FUSE not usable here)")
+	skip(t, "mount did not come up (FUSE not usable here)")
 	return nil
 }
 
@@ -175,4 +175,15 @@ func TestKillDuringWrites(t *testing.T) {
 	if _, orphans, _ := st.Fsck(ctx); orphans != 0 {
 		t.Errorf("orphans after remount = %d, want 0", orphans)
 	}
+}
+
+// skip skips a test that needs FUSE, unless TUPLEFS_REQUIRE_FUSE is set, in
+// which case missing FUSE support is a failure. CI sets it so that the mount
+// tests cannot silently stop running.
+func skip(t *testing.T, why string) {
+	t.Helper()
+	if os.Getenv("TUPLEFS_REQUIRE_FUSE") != "" {
+		t.Fatal(why)
+	}
+	t.Skip(why)
 }

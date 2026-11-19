@@ -22,11 +22,11 @@ import (
 func mountFS(t *testing.T) (string, *store.Store) {
 	t.Helper()
 	if _, err := os.Stat("/dev/fuse"); err != nil {
-		t.Skip("no /dev/fuse")
+		skip(t, "no /dev/fuse")
 	}
 	if _, err := exec.LookPath("fusermount"); err != nil {
 		if _, err := exec.LookPath("fusermount3"); err != nil {
-			t.Skip("no fusermount")
+			skip(t, "no fusermount")
 		}
 	}
 	ctx := context.Background()
@@ -54,7 +54,7 @@ func mountFS(t *testing.T) (string, *store.Store) {
 	server, err = Mount(st, dir, Options{})
 	if err != nil {
 		st.Close()
-		t.Skipf("cannot mount: %v", err)
+		skip(t, "cannot mount: "+err.Error())
 	}
 	t.Cleanup(func() {
 		if err := server.Unmount(); err != nil {
@@ -290,4 +290,15 @@ func TestMountPermissionsAreEnforced(t *testing.T) {
 	if err := os.WriteFile(mnt+"/ro/f", nil, 0o644); !errors.Is(err, os.ErrPermission) {
 		t.Fatalf("creating in a read-only directory = %v, want permission denied", err)
 	}
+}
+
+// skip skips a test that needs FUSE, unless TUPLEFS_REQUIRE_FUSE is set, in
+// which case missing FUSE support is a failure. CI sets it so that the mount
+// tests cannot silently stop running.
+func skip(t *testing.T, why string) {
+	t.Helper()
+	if os.Getenv("TUPLEFS_REQUIRE_FUSE") != "" {
+		t.Fatal(why)
+	}
+	t.Skip(why)
 }
