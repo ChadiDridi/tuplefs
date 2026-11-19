@@ -8,7 +8,9 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/url"
@@ -34,7 +36,11 @@ const (
 	// MaxFileSize is the largest file the store accepts.
 	MaxFileSize = 1 << 50
 
-	schemaVersion = "1"
+	// Schema versions. Version 2 keeps file contents in backing files next
+	// to the database (see FormatOptions.DataFiles); a build that only knows
+	// version 1 must not mount it, since it would see every file as empty.
+	schemaVersion      = "1"
+	schemaVersionFiles = "2"
 	// pgLockKey identifies the single-mount advisory lock ("tuplefs").
 	pgLockKey = 0x7475706c656673
 	// pgTreeLockKey serializes directory moves between parents.
@@ -69,7 +75,12 @@ type Store struct {
 	wmu       sync.Mutex
 	sync      SyncMode
 	blockSize int64
-	rebound   sync.Map // query -> query with $n placeholders
+	dataFiles bool   // file contents live in backing files, not in blocks
+	uuid      string // identifies the file system to its backing directory
+
+	onDelete func(ino uint64)
+	deleted  sync.Map // *sql.Tx -> []uint64, inodes deleted by a transaction in flight
+	rebound  sync.Map // query -> query with $n placeholders
 
 	lockFile *os.File
 	lockConn *sql.Conn
@@ -140,6 +151,9 @@ func (s *Store) Close() error {
 	}
 	return err
 }
+
+// Path returns the SQLite file, or "" on PostgreSQL.
+func (s *Store) Path() string { return s.path }
 
 // BlockSize returns the data block size chosen at mkfs time.
 func (s *Store) BlockSize() int64 { return s.blockSize }
@@ -214,6 +228,27 @@ func (s *Store) Formatted(ctx context.Context) (bool, error) {
 // Format creates an empty file system whose root directory has the given
 // owner and mode. It fails if the database already holds one.
 func (s *Store) Format(ctx context.Context, blockSize int64, uid, gid, mode uint32) error {
+	return s.FormatWith(ctx, FormatOptions{BlockSize: blockSize, Uid: uid, Gid: gid, Mode: mode})
+}
+
+// FormatOptions describes a new file system.
+type FormatOptions struct {
+	BlockSize int64
+	Uid, Gid  uint32 // owner of the root directory
+	Mode      uint32 // permission bits of the root directory
+	// DataFiles keeps the contents of regular files in backing files outside
+	// the database. Metadata stays transactional; data is read and written at
+	// the speed of the underlying file system and with its guarantees.
+	DataFiles bool
+}
+
+// FormatWith creates an empty file system. It fails if the database already
+// holds one.
+func (s *Store) FormatWith(ctx context.Context, o FormatOptions) error {
+	blockSize, uid, gid, mode := o.BlockSize, o.Uid, o.Gid, o.Mode
+	if blockSize == 0 {
+		blockSize = DefaultBlockSize
+	}
 	if blockSize < 512 || blockSize > 4<<20 || blockSize&(blockSize-1) != 0 {
 		return fmt.Errorf("block size %d must be a power of two between 512 and 4MiB", blockSize)
 	}
@@ -239,12 +274,20 @@ func (s *Store) Format(ctx context.Context, blockSize int64, uid, gid, mode uint
 				return err
 			}
 		}
-		for k, v := range map[string]string{
+		meta := map[string]string{
 			"version":    schemaVersion,
 			"block_size": strconv.FormatInt(blockSize, 10),
 			"created":    time.Now().UTC().Format(time.RFC3339),
 			"sync_epoch": "0",
-		} {
+		}
+		if o.DataFiles {
+			var id [16]byte
+			if _, err := rand.Read(id[:]); err != nil {
+				return err
+			}
+			meta["version"], meta["data"], meta["uuid"], meta["clean"] = schemaVersionFiles, "files", hex.EncodeToString(id[:]), "1"
+		}
+		for k, v := range meta {
 			if _, err := tx.ExecContext(ctx, s.q(`INSERT INTO meta (key, value) VALUES (?, ?)`), k, v); err != nil {
 				return err
 			}
@@ -261,8 +304,15 @@ func (s *Store) Load(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("not a tuplefs database: %w", err)
 	}
-	if version != schemaVersion {
-		return fmt.Errorf("unsupported schema version %s (this build reads version %s)", version, schemaVersion)
+	switch version {
+	case schemaVersion:
+	case schemaVersionFiles:
+		s.dataFiles = true
+		if err := s.rdb.QueryRowContext(ctx, s.q(`SELECT value FROM meta WHERE key = ?`), "uuid").Scan(&s.uuid); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unsupported schema version %s (this build reads versions %s and %s)", version, schemaVersion, schemaVersionFiles)
 	}
 	if err := s.rdb.QueryRowContext(ctx, s.q(`SELECT value FROM meta WHERE key = ?`), "block_size").Scan(&bs); err != nil {
 		return err
@@ -421,10 +471,22 @@ func (s *Store) runTx(ctx context.Context, db *sql.DB, opts *sql.TxOptions, fn f
 		return err
 	}
 	if err := fn(tx); err != nil {
+		s.deleted.Delete(tx)
 		tx.Rollback()
 		return err
 	}
-	return tx.Commit()
+	inos, _ := s.deleted.LoadAndDelete(tx)
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// Only now is it certain the inodes are gone, so only now may anything
+	// outside the database (their backing files) be removed.
+	if inos != nil && s.onDelete != nil {
+		for _, ino := range inos.([]uint64) {
+			s.onDelete(ino)
+		}
+	}
+	return nil
 }
 
 // Sync forces everything committed so far to stable storage. It is what

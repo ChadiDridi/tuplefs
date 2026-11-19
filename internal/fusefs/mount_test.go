@@ -14,6 +14,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 
+	"github.com/ChadiDridi/tuplefs/internal/backing"
 	"github.com/ChadiDridi/tuplefs/internal/store"
 )
 
@@ -43,15 +44,23 @@ func mountFS(t *testing.T) (string, *store.Store) {
 			t.Fatal(err)
 		}
 	}
-	if err := st.Format(ctx, 4096, uint32(os.Getuid()), uint32(os.Getgid()), 0o755); err != nil {
+	hybrid := os.Getenv("TUPLEFS_TEST_DATA") == "files"
+	if err := st.FormatWith(ctx, store.FormatOptions{BlockSize: 4096, Uid: uint32(os.Getuid()), Gid: uint32(os.Getgid()), Mode: 0o755, DataFiles: hybrid}); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.Load(ctx); err != nil {
 		t.Fatal(err)
 	}
+	var data *backing.Dir
+	if hybrid {
+		if data, err = backing.Create(t.TempDir(), st.UUID()); err != nil {
+			t.Fatal(err)
+		}
+	}
 	dir := t.TempDir()
 	var server *fuse.Server
-	server, err = Mount(st, dir, Options{})
+	var fsys *FS
+	server, fsys, err = Mount(st, dir, Options{Data: data})
 	if err != nil {
 		st.Close()
 		skip(t, "cannot mount: "+err.Error())
@@ -60,9 +69,19 @@ func mountFS(t *testing.T) (string, *store.Store) {
 		if err := server.Unmount(); err != nil {
 			t.Errorf("unmount: %v", err)
 		}
+		if err := fsys.Close(ctx); err != nil {
+			t.Errorf("close: %v", err)
+		}
 		problems, orphans, err := st.Fsck(ctx)
 		if err != nil {
 			t.Errorf("fsck: %v", err)
+		}
+		if data != nil {
+			more, err := CheckFiles(ctx, st, data)
+			if err != nil {
+				t.Errorf("fsck of backing files: %v", err)
+			}
+			problems = append(problems, more...)
 		}
 		for _, p := range problems {
 			t.Errorf("fsck: %s: %s", p.Check, p.Detail)
@@ -72,7 +91,37 @@ func mountFS(t *testing.T) (string, *store.Store) {
 		}
 		st.Close()
 	})
+	mounted[dir] = fsys
 	return dir, st
+}
+
+// mounted maps a test's mount point to its file system.
+var mounted = map[string]*FS{}
+
+// TestPassthrough checks that, where the kernel can read and write backing
+// files itself, it does: no file data may go through this process. CI runs it
+// as root on a kernel with FUSE passthrough and sets TUPLEFS_REQUIRE_PASSTHROUGH.
+func TestPassthrough(t *testing.T) {
+	if os.Getenv("TUPLEFS_TEST_DATA") != "files" {
+		t.Skip("only the hybrid layout has backing files")
+	}
+	mnt, _ := mountFS(t)
+	data := bytes.Repeat([]byte("passthrough "), 100000)
+	if err := os.WriteFile(mnt+"/f", data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(mnt + "/f")
+	if err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("round trip differs (%v)", err)
+	}
+	if st, err := os.Stat(mnt + "/f"); err != nil || st.Size() != int64(len(data)) {
+		t.Fatalf("size after write = %v, %v", st, err)
+	}
+	n := mounted[mnt].ServerIO.Load()
+	t.Logf("reads and writes that went through tuplefs: %d", n)
+	if os.Getenv("TUPLEFS_REQUIRE_PASSTHROUGH") != "" && n != 0 {
+		t.Fatalf("passthrough is required here, but %d reads and writes went through tuplefs", n)
+	}
 }
 
 func write(t *testing.T, path, content string) {

@@ -10,8 +10,12 @@ permissions:
 
 jobs:
   test:
-    name: test (SQLite, real FUSE mounts)
+    name: test (SQLite, data in ${{ matrix.data }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        data: [db, files]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -26,11 +30,16 @@ jobs:
       - name: Test
         env:
           TUPLEFS_REQUIRE_FUSE: "1" # fail, do not skip, if a mount is impossible
+          TUPLEFS_TEST_DATA: ${{ matrix.data }}
         run: go test -race ./...
 
   postgres:
-    name: test (PostgreSQL)
+    name: test (PostgreSQL, data in ${{ matrix.data }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        data: [db, files]
     services:
       postgres:
         image: postgres:17
@@ -54,12 +63,33 @@ jobs:
       - name: Test
         env:
           TUPLEFS_REQUIRE_FUSE: "1"
+          TUPLEFS_TEST_DATA: ${{ matrix.data }}
           TUPLEFS_TEST_POSTGRES: postgres://postgres:tuplefs@127.0.0.1:5432/tuplefs?sslmode=disable
         run: go test -p 1 ./internal/...
 
-  conformance:
-    name: POSIX conformance (pjdfstest)
+  passthrough:
+    name: test (root, kernel passthrough required)
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install FUSE
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fuse3
+      - name: Test as root
+        run: |
+          uname -r
+          sudo env "PATH=$PATH" TUPLEFS_REQUIRE_FUSE=1 TUPLEFS_TEST_DATA=files TUPLEFS_REQUIRE_PASSTHROUGH=1 \
+            go test -v -run 'TestPassthrough|TestMount|TestKill' ./internal/fusefs/ ./cmd/tuplefs/
+
+  conformance:
+    name: POSIX conformance (pjdfstest, data in ${{ matrix.data }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        data: [db, files]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -76,7 +106,7 @@ jobs:
           go build -o /tmp/tuplefs ./cmd/tuplefs
           echo user_allow_other | sudo tee -a /etc/fuse.conf
           sudo mkdir -p /mnt/tuplefs
-          sudo /tmp/tuplefs mkfs /tmp/fs.db
+          sudo /tmp/tuplefs mkfs -data ${{ matrix.data }} /tmp/fs.db
           sudo /tmp/tuplefs mount -allow-other /tmp/fs.db /mnt/tuplefs &
           for i in $(seq 1 50); do mountpoint -q /mnt/tuplefs && break; sleep 0.2; done
           mountpoint /mnt/tuplefs
@@ -85,7 +115,7 @@ jobs:
           cd /mnt/tuplefs
           sudo prove -r /tmp/pjdfstest/tests 2>&1 | tee /tmp/pjdfstest.log | tail -n 80
           {
-            echo '### pjdfstest'
+            echo '### pjdfstest, data in ${{ matrix.data }}'
             echo '```'
             tail -n 40 /tmp/pjdfstest.log
             echo '```'
@@ -95,5 +125,37 @@ jobs:
         if: always()
         run: |
           sudo fusermount3 -u /mnt/tuplefs
-          sleep 1
+          sleep 3
           sudo /tmp/tuplefs fsck /tmp/fs.db
+
+  benchmark:
+    name: benchmark (same runner, same disk)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install FUSE
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fuse3
+      - name: Run
+        run: |
+          go build -o /tmp/tuplefs ./cmd/tuplefs
+          echo user_allow_other | sudo tee -a /etc/fuse.conf
+          sudo mkdir -p /bench/local /bench/mnt
+          {
+            echo "kernel $(uname -r), $(nproc) CPUs, $(df -T /bench | tail -1 | awk '{print $2}')"
+            echo "===== local directory"
+            sudo bench/bench.sh /bench/local
+            for layout in db files; do
+              sudo rm -rf /bench/fs.db*
+              sudo /tmp/tuplefs mkfs -data $layout /bench/fs.db >/dev/null
+              sudo /tmp/tuplefs mount /bench/fs.db /bench/mnt 2>/bench/mount.log &
+              for i in $(seq 1 50); do mountpoint -q /bench/mnt && break; sleep 0.2; done
+              echo "===== tuplefs on SQLite, data in $layout, mounted as root"
+              sudo bench/bench.sh /bench/mnt
+              sudo fusermount3 -u /bench/mnt; sleep 3
+              sudo /tmp/tuplefs fsck /bench/fs.db
+            done
+          } 2>&1 | tee /tmp/bench.txt
+          { echo '```'; cat /tmp/bench.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

@@ -12,12 +12,14 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 
+	"github.com/ChadiDridi/tuplefs/internal/backing"
 	"github.com/ChadiDridi/tuplefs/internal/store"
 )
 
@@ -26,21 +28,45 @@ type Options struct {
 	AllowOther bool
 	ReadOnly   bool
 	Debug      bool
+	// Data is the directory of backing files, for a file system formatted
+	// with the hybrid layout. Nil when file contents live in the database.
+	Data *backing.Dir
 }
 
 // FS is a mounted file system.
 type FS struct {
-	st *store.Store
+	st    *store.Store
+	files *backing.Dir // nil unless file contents live in backing files
 
 	mu       sync.Mutex
 	open     map[uint64]int      // open handles per inode
 	unlinked map[uint64]struct{} // open inodes that lost their last name
+	dirty    map[uint64]struct{} // file-backed inodes whose size in the database is stale
+
+	stop chan struct{}
+	done chan struct{}
+
+	// ServerIO counts reads and writes of backing files that went through
+	// this process. With kernel passthrough it stays at zero.
+	ServerIO atomic.Int64
 }
 
 // Mount mounts the file system held in st at dir. The caller must have loaded
-// the store. Wait on the returned server to block until it is unmounted.
-func Mount(st *store.Store, dir string, opts Options) (*fuse.Server, error) {
-	fsys := &FS{st: st, open: map[uint64]int{}, unlinked: map[uint64]struct{}{}}
+// the store. Wait on the returned server to block until it is unmounted, then
+// call FS.Close.
+func Mount(st *store.Store, dir string, opts Options) (*fuse.Server, *FS, error) {
+	fsys := &FS{st: st, files: opts.Data, open: map[uint64]int{}, unlinked: map[uint64]struct{}{}, dirty: map[uint64]struct{}{}}
+	if fsys.files != nil {
+		// A backing file goes away only after its inode row is gone for good.
+		st.OnDelete(func(ino uint64) {
+			fsys.mu.Lock()
+			delete(fsys.dirty, ino)
+			fsys.mu.Unlock()
+			if err := fsys.files.Remove(ino); err != nil {
+				log.Printf("tuplefs: removing backing file of inode %d: %v", ino, err)
+			}
+		})
+	}
 	// One process owns the database (see Store.LockMount), so every change
 	// goes through this mount and the kernel may cache what it is told.
 	timeout := time.Second
@@ -48,7 +74,7 @@ func Mount(st *store.Store, dir string, opts Options) (*fuse.Server, error) {
 	if opts.ReadOnly {
 		mountOpts = append(mountOpts, "ro")
 	}
-	return fs.Mount(dir, &node{fsys: fsys}, &fs.Options{
+	server, err := fs.Mount(dir, &node{fsys: fsys}, &fs.Options{
 		MountOptions: fuse.MountOptions{
 			FsName:     "tuplefs:" + st.Backend(),
 			Name:       "tuplefs",
@@ -62,6 +88,88 @@ func Mount(st *store.Store, dir string, opts Options) (*fuse.Server, error) {
 		RootStableAttr:  &fs.StableAttr{Ino: store.RootIno},
 		NullPermissions: true, // report mode 000 as stored, not as a default
 	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if fsys.files != nil {
+		fsys.stop, fsys.done = make(chan struct{}), make(chan struct{})
+		go fsys.flushLoop()
+	}
+	return server, fsys, nil
+}
+
+// Close finishes the work of an unmounted file system: the sizes of files
+// written since the last flush are copied into the database.
+func (f *FS) Close(ctx context.Context) error {
+	if f.files == nil {
+		return nil
+	}
+	close(f.stop)
+	<-f.done
+	return f.flushDirty(ctx)
+}
+
+// flushLoop keeps the sizes recorded in the database close to the truth, so
+// that queries see them, without a transaction for every write.
+func (f *FS) flushLoop() {
+	defer close(f.done)
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-f.stop:
+			return
+		case <-tick.C:
+			if err := f.flushDirty(context.Background()); err != nil {
+				log.Printf("tuplefs: recording file sizes: %v", err)
+			}
+		}
+	}
+}
+
+func (f *FS) markDirty(ino uint64) {
+	f.mu.Lock()
+	f.dirty[ino] = struct{}{}
+	f.mu.Unlock()
+}
+
+// flushDirty copies the size and mtime of every backing file changed since
+// the last call into the inodes table.
+func (f *FS) flushDirty(ctx context.Context) error {
+	f.mu.Lock()
+	inos := make([]uint64, 0, len(f.dirty))
+	for ino := range f.dirty {
+		inos = append(inos, ino)
+	}
+	clear(f.dirty)
+	f.mu.Unlock()
+	states := make([]store.FileState, 0, len(inos))
+	for _, ino := range inos {
+		if st, ok, err := f.files.Stat(ino); err == nil && ok {
+			states = append(states, store.FileState{Ino: ino, Size: st.Size, MtimeNs: st.MtimeNs})
+		}
+	}
+	return f.st.UpdateFileStates(ctx, states)
+}
+
+// fileBacked reports whether an inode's contents live in a backing file.
+func (f *FS) fileBacked(mode uint32) bool {
+	return f.files != nil && mode&syscall.S_IFMT == syscall.S_IFREG
+}
+
+// fill converts stored metadata to what the kernel sees. For a file-backed
+// inode the backing file is the authority on size and modification time.
+func (f *FS) fill(a store.Attr, out *fuse.Attr) {
+	blocks := (a.Size + 511) / 512
+	if f.fileBacked(a.Mode) {
+		a.Size, blocks = 0, 0
+		if st, ok, err := f.files.Stat(a.Ino); err == nil && ok {
+			a.Size, blocks, a.MtimeNs = uint64(st.Size), uint64(st.Blocks), st.MtimeNs
+			a.CtimeNs = max(a.CtimeNs, st.CtimeNs)
+		}
+	}
+	fillAttr(a, out)
+	out.Blocks = blocks
 }
 
 // node is one inode of the mounted tree. All its state lives in the database;
@@ -142,7 +250,7 @@ func fillAttr(a store.Attr, out *fuse.Attr) {
 // child returns the tree node for an inode, creating it on first sight. Hard
 // links resolve to the same node because the inode number is the identity.
 func (n *node) child(ctx context.Context, a store.Attr, out *fuse.EntryOut) *fs.Inode {
-	fillAttr(a, &out.Attr)
+	n.fsys.fill(a, &out.Attr)
 	return n.NewInode(ctx, &node{fsys: n.fsys}, fs.StableAttr{Mode: a.Mode & syscall.S_IFMT, Ino: a.Ino})
 }
 
@@ -159,7 +267,7 @@ func (n *node) Getattr(ctx context.Context, _ fs.FileHandle, out *fuse.AttrOut) 
 	if err != nil {
 		return errno(err)
 	}
-	fillAttr(a, &out.Attr)
+	n.fsys.fill(a, &out.Attr)
 	return 0
 }
 
@@ -185,11 +293,28 @@ func (n *node) Setattr(ctx context.Context, _ fs.FileHandle, in *fuse.SetAttrIn,
 		v := t.UnixNano()
 		req.MtimeNs = &v
 	}
+	if f := n.fsys; f.fileBacked(n.StableAttr().Mode) {
+		// The backing file first: if tuplefs dies in between, the next mount
+		// corrects the database from the file, never the other way round.
+		if req.Size != nil {
+			if *req.Size > store.MaxFileSize {
+				return syscall.EFBIG
+			}
+			if err := f.files.Truncate(n.ino(), int64(*req.Size)); err != nil {
+				return errno(err)
+			}
+		}
+		if req.MtimeNs != nil {
+			if err := f.files.SetMtime(n.ino(), *req.MtimeNs); err != nil {
+				return errno(err)
+			}
+		}
+	}
 	a, err := n.fsys.st.SetAttr(bg(ctx), n.ino(), req)
 	if err != nil {
 		return errno(err)
 	}
-	fillAttr(a, &out.Attr)
+	n.fsys.fill(a, &out.Attr)
 	return 0
 }
 
@@ -221,12 +346,15 @@ func (n *node) Symlink(ctx context.Context, target, name string, out *fuse.Entry
 }
 
 func (n *node) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
-	inode, a, errno := n.mknod(ctx, name, syscall.S_IFREG|mode&0o7777, 0, "", out)
-	if errno != 0 {
-		return nil, nil, 0, errno
+	inode, a, eno := n.mknod(ctx, name, syscall.S_IFREG|mode&0o7777, 0, "", out)
+	if eno != 0 {
+		return nil, nil, 0, eno
 	}
-	n.fsys.opened(a.Ino)
-	return inode, &handle{}, fuse.FOPEN_KEEP_CACHE, 0
+	h, err := n.fsys.newHandle(a.Ino, a.Mode, true)
+	if err != nil {
+		return nil, nil, 0, errno(err)
+	}
+	return inode, h, fuse.FOPEN_KEEP_CACHE, 0
 }
 
 func (n *node) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
@@ -275,15 +403,35 @@ func (n *node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	return fs.NewListDirStream(list), 0
 }
 
-// handle is an open file. It carries no state, but go-fuse only reports the
+// handle is an open file. In the hybrid layout it holds a descriptor of the
+// backing file; otherwise it carries no state, but go-fuse only reports the
 // close of a file whose open returned a handle.
-type handle struct{}
+type handle struct {
+	fd       int // backing file, or -1
+	writable bool
+}
 
-// opened records a new open handle on an inode.
-func (f *FS) opened(ino uint64) {
+// PassthroughFd offers the backing file to the kernel, which then reads and
+// writes it directly without calling this process. It needs a recent kernel
+// and a mount by root; go-fuse falls back to Read and Write otherwise. Every
+// open of a file-backed inode offers it, because the kernel refuses to mix
+// passthrough and ordinary opens of one inode.
+func (h *handle) PassthroughFd() (int, bool) { return h.fd, h.fd >= 0 }
+
+// newHandle records a new open of an inode.
+func (f *FS) newHandle(ino uint64, mode uint32, writable bool) (*handle, error) {
+	h := &handle{fd: -1, writable: writable}
+	if f.fileBacked(mode) {
+		fd, err := f.files.OpenFile(ino)
+		if err != nil {
+			return nil, err
+		}
+		h.fd = fd
+	}
 	f.mu.Lock()
 	f.open[ino]++
 	f.mu.Unlock()
+	return h, nil
 }
 
 // stillOpen is called by the store when a file loses its last name. If a
@@ -302,16 +450,30 @@ func (f *FS) stillOpen(ino uint64) bool {
 func (n *node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	if flags&syscall.O_TRUNC != 0 {
 		var zero uint64
+		if n.fsys.fileBacked(n.StableAttr().Mode) {
+			if err := n.fsys.files.Truncate(n.ino(), 0); err != nil {
+				return nil, 0, errno(err)
+			}
+		}
 		if _, err := n.fsys.st.SetAttr(bg(ctx), n.ino(), store.SetAttrReq{Size: &zero}); err != nil {
 			return nil, 0, errno(err)
 		}
 	}
-	n.fsys.opened(n.ino())
-	return &handle{}, fuse.FOPEN_KEEP_CACHE, 0
+	h, err := n.fsys.newHandle(n.ino(), n.StableAttr().Mode, flags&syscall.O_ACCMODE != syscall.O_RDONLY)
+	if err != nil {
+		return nil, 0, errno(err)
+	}
+	return h, fuse.FOPEN_KEEP_CACHE, 0
 }
 
-func (n *node) Release(ctx context.Context, _ fs.FileHandle) syscall.Errno {
+func (n *node) Release(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 	f, ino := n.fsys, n.ino()
+	if h, ok := fh.(*handle); ok && h.fd >= 0 {
+		syscall.Close(h.fd)
+		if h.writable {
+			f.markDirty(ino) // the kernel may have written without telling us
+		}
+	}
 	f.mu.Lock()
 	f.open[ino]--
 	last := f.open[ino] <= 0
@@ -330,7 +492,11 @@ func (n *node) Release(ctx context.Context, _ fs.FileHandle) syscall.Errno {
 	return 0
 }
 
-func (n *node) Read(ctx context.Context, _ fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+func (n *node) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	if h, ok := fh.(*handle); ok && h.fd >= 0 {
+		n.fsys.ServerIO.Add(1)
+		return fuse.ReadResultFd(uintptr(h.fd), off, len(dest)), 0
+	}
 	buf, err := n.fsys.st.Read(bg(ctx), n.ino(), off, len(dest))
 	if err != nil {
 		return nil, errno(err)
@@ -338,16 +504,50 @@ func (n *node) Read(ctx context.Context, _ fs.FileHandle, dest []byte, off int64
 	return fuse.ReadResultData(buf), 0
 }
 
-func (n *node) Write(ctx context.Context, _ fs.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
+func (n *node) Write(ctx context.Context, fh fs.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
+	if h, ok := fh.(*handle); ok && h.fd >= 0 {
+		n.fsys.ServerIO.Add(1)
+		if off+int64(len(data)) > store.MaxFileSize {
+			return 0, syscall.EFBIG
+		}
+		for done := 0; done < len(data); {
+			w, err := syscall.Pwrite(h.fd, data[done:], off+int64(done))
+			if err != nil {
+				return uint32(done), errno(err)
+			}
+			done += w
+		}
+		n.fsys.markDirty(n.ino())
+		return uint32(len(data)), 0
+	}
 	written, err := n.fsys.st.Write(bg(ctx), n.ino(), off, data)
 	return uint32(written), errno(err)
 }
 
-func (n *node) Fsync(ctx context.Context, _ fs.FileHandle, _ uint32) syscall.Errno {
+func (n *node) Fsync(ctx context.Context, fh fs.FileHandle, _ uint32) syscall.Errno {
+	if h, ok := fh.(*handle); ok && h.fd >= 0 {
+		// Data first, then the metadata that describes it.
+		if err := syscall.Fsync(h.fd); err != nil {
+			return errno(err)
+		}
+		n.fsys.markDirty(n.ino())
+	}
+	if n.fsys.files != nil {
+		if err := n.fsys.flushDirty(bg(ctx)); err != nil {
+			return errno(err)
+		}
+	}
 	return errno(n.fsys.st.Sync(bg(ctx)))
 }
 
-func (n *node) Allocate(ctx context.Context, _ fs.FileHandle, off uint64, size uint64, mode uint32) syscall.Errno {
+func (n *node) Allocate(ctx context.Context, fh fs.FileHandle, off uint64, size uint64, mode uint32) syscall.Errno {
+	if h, ok := fh.(*handle); ok && h.fd >= 0 {
+		if off+size > store.MaxFileSize {
+			return syscall.EFBIG
+		}
+		n.fsys.markDirty(n.ino())
+		return errno(syscall.Fallocate(h.fd, mode, int64(off), int64(size)))
+	}
 	return errno(n.fsys.st.Fallocate(bg(ctx), n.ino(), mode, int64(off), int64(size)))
 }
 
@@ -356,6 +556,18 @@ func (n *node) Allocate(ctx context.Context, _ fs.FileHandle, off uint64, size u
 const virtualBytes = 1 << 40
 
 func (n *node) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
+	if n.fsys.files != nil {
+		// File contents dominate, and they live on the backing file system.
+		st, err := n.fsys.files.Statfs()
+		if err != nil {
+			return errno(err)
+		}
+		out.Bsize, out.Frsize = uint32(st.Bsize), uint32(st.Frsize)
+		out.Blocks, out.Bfree, out.Bavail = st.Blocks, st.Bfree, st.Bavail
+		out.Files, out.Ffree = st.Files, st.Ffree
+		out.NameLen = store.MaxNameLen
+		return 0
+	}
 	u, err := n.fsys.st.StatFS(bg(ctx))
 	if err != nil {
 		return errno(err)

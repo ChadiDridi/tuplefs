@@ -249,6 +249,11 @@ func (s *Store) dropIfUnused(ctx context.Context, tx *sql.Tx, ino uint64, open S
 }
 
 func (s *Store) deleteInode(ctx context.Context, tx *sql.Tx, ino uint64) error {
+	if s.onDelete != nil {
+		prev, _ := s.deleted.Load(tx)
+		list, _ := prev.([]uint64)
+		s.deleted.Store(tx, append(list, ino))
+	}
 	for _, q := range []string{`DELETE FROM blocks WHERE ino = ?`, `DELETE FROM xattrs WHERE ino = ?`, `DELETE FROM inodes WHERE ino = ?`} {
 		if _, err := tx.ExecContext(ctx, s.q(q), int64(ino)); err != nil {
 			return err
@@ -671,18 +676,30 @@ func (s *Store) Reap(ctx context.Context, ino uint64) error {
 // cleanup a mount ever needs. It returns how many were removed.
 func (s *Store) ReapOrphans(ctx context.Context) (n int64, err error) {
 	err = s.write(ctx, func(tx *sql.Tx) error {
-		const orphans = `(SELECT ino FROM inodes WHERE nlink = 0)`
-		for _, q := range []string{`DELETE FROM blocks WHERE ino IN ` + orphans, `DELETE FROM xattrs WHERE ino IN ` + orphans} {
-			if _, err := tx.ExecContext(ctx, q); err != nil {
-				return err
-			}
-		}
-		res, err := tx.ExecContext(ctx, `DELETE FROM inodes WHERE nlink = 0`)
+		n = 0
+		rows, err := tx.QueryContext(ctx, `SELECT ino FROM inodes WHERE nlink = 0`)
 		if err != nil {
 			return err
 		}
-		n, err = res.RowsAffected()
-		return err
+		var inos []uint64
+		for rows.Next() {
+			var ino int64
+			if err := rows.Scan(&ino); err != nil {
+				rows.Close()
+				return err
+			}
+			inos = append(inos, uint64(ino))
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		for _, ino := range inos {
+			if err := s.deleteInode(ctx, tx, ino); err != nil {
+				return err
+			}
+		}
+		n = int64(len(inos))
+		return nil
 	})
 	return n, err
 }

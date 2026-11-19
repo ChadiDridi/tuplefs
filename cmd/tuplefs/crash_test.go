@@ -64,6 +64,11 @@ func TestKillDuringWrites(t *testing.T) {
 		t.Fatalf("build: %v\n%s", err, out)
 	}
 	os.Mkdir(mnt, 0o755)
+	if os.Getenv("TUPLEFS_TEST_DATA") == "files" {
+		if out, err := exec.Command(bin, "mkfs", "-data", "files", db).CombinedOutput(); err != nil {
+			t.Fatalf("mkfs: %v\n%s", err, out)
+		}
+	}
 	cmd := startMount(t, bin, db, mnt)
 
 	// A file that is fsynced before the crash.
@@ -138,6 +143,11 @@ func TestKillDuringWrites(t *testing.T) {
 	defer func() {
 		exec.Command(umount, "-u", mnt).Run()
 		cmd.Wait()
+		// After a clean unmount the whole file system, backing files
+		// included, must check out.
+		if out, err := exec.Command(bin, "fsck", db).CombinedOutput(); err != nil {
+			t.Errorf("fsck after remount and clean unmount: %v\n%s", err, out)
+		}
 	}()
 	if got, err := os.ReadFile(filepath.Join(mnt, "durable")); err != nil || !bytes.Equal(got, durable) {
 		t.Errorf("fsynced file after crash: %d bytes, %v", len(got), err)
