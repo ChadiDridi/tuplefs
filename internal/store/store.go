@@ -78,6 +78,9 @@ type Store struct {
 	dataFiles bool   // file contents live in backing files, not in blocks
 	uuid      string // identifies the file system to its backing directory
 
+	// The two reads behind almost every request, prepared once.
+	getAttrStmt, lookupStmt *sql.Stmt
+
 	onDelete func(ino uint64)
 	deleted  sync.Map // *sql.Tx -> []uint64, inodes deleted by a transaction in flight
 	rebound  sync.Map // query -> query with $n placeholders
@@ -317,7 +320,13 @@ func (s *Store) Load(ctx context.Context) error {
 	if err := s.rdb.QueryRowContext(ctx, s.q(`SELECT value FROM meta WHERE key = ?`), "block_size").Scan(&bs); err != nil {
 		return err
 	}
-	s.blockSize, err = strconv.ParseInt(bs, 10, 64)
+	if s.blockSize, err = strconv.ParseInt(bs, 10, 64); err != nil {
+		return err
+	}
+	if s.getAttrStmt, err = s.rdb.PrepareContext(ctx, s.q(`SELECT `+attrCols+` FROM inodes WHERE ino = ?`)); err != nil {
+		return err
+	}
+	s.lookupStmt, err = s.rdb.PrepareContext(ctx, s.q(`SELECT `+attrCols+` FROM inodes WHERE ino = (SELECT ino FROM dirents WHERE parent = ? AND name = ?)`))
 	return err
 }
 

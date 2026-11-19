@@ -106,12 +106,9 @@ func (s *Store) addNlink(ctx context.Context, tx *sql.Tx, ino uint64, delta int,
 }
 
 // GetAttr returns the metadata of an inode.
-func (s *Store) GetAttr(ctx context.Context, ino uint64) (a Attr, err error) {
-	err = s.read(ctx, func(tx *sql.Tx) error {
-		a, err = s.getAttr(ctx, tx, ino)
-		return err
-	})
-	return a, err
+func (s *Store) GetAttr(ctx context.Context, ino uint64) (Attr, error) {
+	// One statement sees one snapshot, so it needs no transaction around it.
+	return scanAttr(s.getAttrStmt.QueryRowContext(ctx, int64(ino)))
 }
 
 // Lookup resolves a name in a directory.
@@ -119,11 +116,7 @@ func (s *Store) Lookup(ctx context.Context, parent uint64, name string) (a Attr,
 	if len(name) > MaxNameLen {
 		return a, syscall.ENAMETOOLONG
 	}
-	err = s.read(ctx, func(tx *sql.Tx) error {
-		a, err = scanAttr(tx.QueryRowContext(ctx, s.q(`SELECT `+attrCols+` FROM inodes WHERE ino = (SELECT ino FROM dirents WHERE parent = ? AND name = ?)`), int64(parent), name))
-		return err
-	})
-	return a, err
+	return scanAttr(s.lookupStmt.QueryRowContext(ctx, int64(parent), name))
 }
 
 // Mknod creates a file, directory, symlink, device, FIFO or socket, depending
