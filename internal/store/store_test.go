@@ -3,9 +3,12 @@ package store
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"math/rand"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"testing"
 )
@@ -476,6 +479,113 @@ func TestFsckDetectsCorruption(t *testing.T) {
 			t.Errorf("fsck did not report: %s (got %v)", want, problems)
 		}
 	}
+}
+
+// TestConcurrentNamespaceStress runs random creates, links, unlinks, renames
+// and directory moves from many goroutines on a handful of shared names, so
+// that operations collide constantly. Individual operations may fail with an
+// ordinary errno; what must hold is that the tree is consistent afterwards:
+// no loops, no lost directories, correct link counts.
+func TestConcurrentNamespaceStress(t *testing.T) {
+	s := newStore(t, 4096)
+	var mu sync.Mutex
+	dirs := []uint64{RootIno}
+	pickDir := func(rng *rand.Rand) uint64 {
+		mu.Lock()
+		defer mu.Unlock()
+		return dirs[rng.Intn(len(dirs))]
+	}
+	var wg sync.WaitGroup
+	for w := 0; w < 8; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			rng := rand.New(rand.NewSource(int64(w)))
+			name := func() string { return fmt.Sprintf("n%d", rng.Intn(6)) }
+			for i := 0; i < 150; i++ {
+				var err error
+				switch rng.Intn(8) {
+				case 0, 1:
+					var a Attr
+					if a, err = s.Mknod(ctx, pickDir(rng), name(), syscall.S_IFDIR|0o755, 0, 0, 0, ""); err == nil {
+						mu.Lock()
+						dirs = append(dirs, a.Ino)
+						mu.Unlock()
+					}
+				case 2:
+					var a Attr
+					if a, err = s.Mknod(ctx, pickDir(rng), name(), syscall.S_IFREG|0o644, 0, 0, 0, ""); err == nil {
+						_, err = s.Write(ctx, a.Ino, 0, []byte("x"))
+						if err == syscall.ENOENT {
+							err = nil // already unlinked and reaped by another worker
+						}
+					}
+				case 3:
+					var ino uint64
+					var nlink uint32
+					if ino, nlink, err = s.Unlink(ctx, pickDir(rng), name()); err == nil && nlink == 0 {
+						err = s.Reap(ctx, ino)
+					}
+				case 4:
+					err = s.Rmdir(ctx, pickDir(rng), name())
+				case 5:
+					var a Attr
+					if a, err = s.Lookup(ctx, pickDir(rng), name()); err == nil {
+						_, err = s.Link(ctx, a.Ino, pickDir(rng), name())
+					}
+				default:
+					flags := []uint32{0, 0, RenameNoReplace, RenameExchange}[rng.Intn(4)]
+					var replaced uint64
+					var nlink uint32
+					if replaced, nlink, err = s.Rename(ctx, pickDir(rng), name(), pickDir(rng), name(), flags); err == nil && replaced != 0 && nlink == 0 {
+						err = s.Reap(ctx, replaced)
+					}
+				}
+				var e syscall.Errno
+				if err != nil && !errors.As(err, &e) {
+					t.Errorf("worker %d: database error: %v", w, err)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	checkClean(t, s)
+	if _, orphans, _ := s.Fsck(ctx); orphans != 0 {
+		t.Errorf("%d orphans left", orphans)
+	}
+}
+
+// TestOpposingDirectoryMovesNeverMakeLoop moves directory A below B and, at
+// the same moment, B below A. Each move is legal on its own; if both went
+// through, the two directories would form a loop cut off from the root.
+func TestOpposingDirectoryMovesNeverMakeLoop(t *testing.T) {
+	s := newStore(t, 4096)
+	for i := 0; i < 60; i++ {
+		x := mk(t, s, RootIno, fmt.Sprintf("x%d", i), syscall.S_IFDIR|0o755)
+		y := mk(t, s, RootIno, fmt.Sprintf("y%d", i), syscall.S_IFDIR|0o755)
+		a := mk(t, s, x.Ino, "A", syscall.S_IFDIR|0o755)
+		b := mk(t, s, y.Ino, "B", syscall.S_IFDIR|0o755)
+		inA := mk(t, s, a.Ino, "inner", syscall.S_IFDIR|0o755)
+		inB := mk(t, s, b.Ino, "inner", syscall.S_IFDIR|0o755)
+		var wg sync.WaitGroup
+		errs := make([]error, 2)
+		start := make(chan struct{})
+		wg.Add(2)
+		go func() { defer wg.Done(); <-start; _, _, errs[0] = s.Rename(ctx, x.Ino, "A", inB.Ino, "A", 0) }()
+		go func() { defer wg.Done(); <-start; _, _, errs[1] = s.Rename(ctx, y.Ino, "B", inA.Ino, "B", 0) }()
+		close(start)
+		wg.Wait()
+		if errs[0] == nil && errs[1] == nil {
+			t.Fatalf("round %d: both moves succeeded", i)
+		}
+		for _, err := range errs {
+			if err != nil && err != syscall.EINVAL {
+				t.Fatalf("round %d: unexpected error %v", i, err)
+			}
+		}
+	}
+	checkClean(t, s)
 }
 
 func itoa(n uint64) string {

@@ -39,6 +39,9 @@ func (s *Store) SetXattr(ctx context.Context, ino uint64, name string, value []b
 		value = []byte{}
 	}
 	return s.write(ctx, func(tx *sql.Tx) error {
+		if err := s.lock(ctx, tx, ino); err != nil {
+			return err
+		}
 		if _, err := s.getAttr(ctx, tx, ino); err != nil {
 			return err
 		}
@@ -87,6 +90,9 @@ func (s *Store) ListXattr(ctx context.Context, ino uint64) (names []string, err 
 // RemoveXattr deletes an extended attribute.
 func (s *Store) RemoveXattr(ctx context.Context, ino uint64, name string) error {
 	return s.write(ctx, func(tx *sql.Tx) error {
+		if err := s.lock(ctx, tx, ino); err != nil {
+			return err
+		}
 		res, err := tx.ExecContext(ctx, s.q(`DELETE FROM xattrs WHERE ino = ? AND name = ?`), int64(ino), name)
 		if err != nil {
 			return err

@@ -138,6 +138,9 @@ func (s *Store) Mknod(ctx context.Context, parent uint64, name string, mode, rde
 		return a, syscall.EILSEQ
 	}
 	err = s.write(ctx, func(tx *sql.Tx) error {
+		if err := s.lock(ctx, tx, parent); err != nil {
+			return err
+		}
 		dir, err := s.getDir(ctx, tx, parent)
 		if err != nil {
 			return err
@@ -194,6 +197,12 @@ func (s *Store) Link(ctx context.Context, ino, newParent uint64, newName string)
 		return a, err
 	}
 	err = s.write(ctx, func(tx *sql.Tx) error {
+		if err := s.lock(ctx, tx, newParent); err != nil {
+			return err
+		}
+		if err := s.lock(ctx, tx, ino); err != nil {
+			return err
+		}
 		if a, err = s.getAttr(ctx, tx, ino); err != nil {
 			return err
 		}
@@ -230,7 +239,13 @@ func (s *Store) Link(ctx context.Context, ino, newParent uint64, newName string)
 // nothing has the file open any more.
 func (s *Store) Unlink(ctx context.Context, parent uint64, name string) (ino uint64, nlink uint32, err error) {
 	err = s.write(ctx, func(tx *sql.Tx) error {
+		if err := s.lock(ctx, tx, parent); err != nil {
+			return err
+		}
 		if ino, err = s.lookup(ctx, tx, parent, name); err != nil {
+			return err
+		}
+		if err := s.lock(ctx, tx, ino); err != nil {
 			return err
 		}
 		a, err := s.getAttr(ctx, tx, ino)
@@ -273,8 +288,14 @@ func (s *Store) removeDir(ctx context.Context, tx *sql.Tx, parent, ino uint64, n
 // Rmdir removes an empty directory.
 func (s *Store) Rmdir(ctx context.Context, parent uint64, name string) error {
 	return s.write(ctx, func(tx *sql.Tx) error {
+		if err := s.lock(ctx, tx, parent); err != nil {
+			return err
+		}
 		ino, err := s.lookup(ctx, tx, parent, name)
 		if err != nil {
+			return err
+		}
+		if err := s.lock(ctx, tx, ino); err != nil {
 			return err
 		}
 		a, err := s.getAttr(ctx, tx, ino)
@@ -333,11 +354,12 @@ func (s *Store) Rename(ctx context.Context, oldParent uint64, oldName string, ne
 	}
 	err = s.write(ctx, func(tx *sql.Tx) error {
 		replaced, nlink = 0, 0
-		srcIno, err := s.lookup(ctx, tx, oldParent, oldName)
-		if err != nil {
+		// Both directories first, which freezes the two names, then the
+		// inodes those names point to.
+		if err := s.lock(ctx, tx, oldParent, newParent); err != nil {
 			return err
 		}
-		src, err := s.getAttr(ctx, tx, srcIno)
+		srcIno, err := s.lookup(ctx, tx, oldParent, oldName)
 		if err != nil {
 			return err
 		}
@@ -349,9 +371,26 @@ func (s *Store) Rename(ctx context.Context, oldParent uint64, oldName string, ne
 		if err != nil && err != syscall.ENOENT {
 			return err
 		}
+		if hasDst {
+			err = s.lock(ctx, tx, srcIno, dstIno)
+		} else {
+			err = s.lock(ctx, tx, srcIno)
+		}
+		if err != nil {
+			return err
+		}
+		src, err := s.getAttr(ctx, tx, srcIno)
+		if err != nil {
+			return err
+		}
 		var dst Attr
 		if hasDst {
 			if dst, err = s.getAttr(ctx, tx, dstIno); err != nil {
+				return err
+			}
+		}
+		if oldParent != newParent && (src.IsDir() || dst.IsDir()) {
+			if err := s.lockTree(ctx, tx); err != nil {
 				return err
 			}
 		}
@@ -532,6 +571,9 @@ type SetAttrReq struct {
 // SetAttr changes attributes of an inode: chmod, chown, truncate and utimens.
 func (s *Store) SetAttr(ctx context.Context, ino uint64, req SetAttrReq) (a Attr, err error) {
 	err = s.write(ctx, func(tx *sql.Tx) error {
+		if err := s.lock(ctx, tx, ino); err != nil {
+			return err
+		}
 		if a, err = s.getAttr(ctx, tx, ino); err != nil {
 			return err
 		}
@@ -579,6 +621,9 @@ func (s *Store) SetAttr(ctx context.Context, ino uint64, req SetAttrReq) (a Attr
 // last open handle of an unlinked file is closed.
 func (s *Store) Reap(ctx context.Context, ino uint64) error {
 	return s.write(ctx, func(tx *sql.Tx) error {
+		if err := s.lock(ctx, tx, ino); err != nil {
+			return err
+		}
 		a, err := s.getAttr(ctx, tx, ino)
 		if err == syscall.ENOENT {
 			return nil

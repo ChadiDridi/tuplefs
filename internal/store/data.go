@@ -91,6 +91,9 @@ func (s *Store) Write(ctx context.Context, ino uint64, off int64, data []byte) (
 		return 0, nil
 	}
 	err = s.write(ctx, func(tx *sql.Tx) error {
+		if err := s.lock(ctx, tx, ino); err != nil {
+			return err
+		}
 		var fsize int64
 		err := tx.QueryRowContext(ctx, s.q(`SELECT size FROM inodes WHERE ino = ?`), int64(ino)).Scan(&fsize)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -209,6 +212,9 @@ func (s *Store) Fallocate(ctx context.Context, ino uint64, mode uint32, off, len
 		return syscall.EOPNOTSUPP
 	}
 	return s.write(ctx, func(tx *sql.Tx) error {
+		if err := s.lock(ctx, tx, ino); err != nil {
+			return err
+		}
 		a, err := s.getAttr(ctx, tx, ino)
 		if err != nil {
 			return err

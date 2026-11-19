@@ -37,6 +37,8 @@ const (
 	schemaVersion = "1"
 	// pgLockKey identifies the single-mount advisory lock ("tuplefs").
 	pgLockKey = 0x7475706c656673
+	// pgTreeLockKey serializes directory moves between parents.
+	pgTreeLockKey = pgLockKey + 1
 )
 
 // SyncMode says when committed operations are forced to stable storage.
@@ -332,7 +334,7 @@ func retryable(err error) bool {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		switch pgErr.Code {
-		case "40001", "40P01", "23505": // serialization failure, deadlock, unique violation under a race
+		case "40P01", "40001": // deadlock victim, serialization failure
 			return true
 		}
 	}
@@ -341,16 +343,22 @@ func retryable(err error) bool {
 
 // write runs fn in a read-write transaction. fn may run more than once, so it
 // must not have effects outside the transaction.
+//
+// SQLite has a single writer, so write transactions simply run one at a time.
+// On PostgreSQL they run concurrently at READ COMMITTED, and each operation
+// first locks the inode rows it depends on (see lock), the way a kernel file
+// system locks inodes. Lock order is not global, so PostgreSQL may pick a
+// deadlock victim; that transaction runs again.
 func (s *Store) write(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	if s.dialect == sqliteDialect {
-		// SQLite allows one writer. Queue here instead of spinning on SQLITE_BUSY.
+		// Queue here instead of spinning on SQLITE_BUSY.
 		s.wmu.Lock()
 		defer s.wmu.Unlock()
 		return s.runTx(ctx, s.wdb, nil, fn)
 	}
 	var err error
-	for attempt := 0; attempt < 20; attempt++ {
-		err = s.runTx(ctx, s.wdb, &sql.TxOptions{Isolation: sql.LevelSerializable}, func(tx *sql.Tx) error {
+	for attempt := 0; attempt < 10; attempt++ {
+		err = s.runTx(ctx, s.wdb, nil, func(tx *sql.Tx) error {
 			if s.sync == SyncOnFsync {
 				if _, err := tx.ExecContext(ctx, `SET LOCAL synchronous_commit = off`); err != nil {
 					return err
@@ -361,8 +369,41 @@ func (s *Store) write(ctx context.Context, fn func(tx *sql.Tx) error) error {
 		if !retryable(err) {
 			return err
 		}
-		time.Sleep(time.Duration(attempt+1) * time.Millisecond)
 	}
+	return err
+}
+
+// lock takes the row locks of the given inodes for the rest of the
+// transaction. Holding a directory's lock freezes its entries and link count;
+// holding a file's lock freezes its size, data blocks and link count. Every
+// operation locks before it reads what it is about to change. It is a no-op on
+// SQLite, where the whole transaction is already exclusive.
+func (s *Store) lock(ctx context.Context, tx *sql.Tx, inos ...uint64) error {
+	if s.dialect != postgresDialect {
+		return nil
+	}
+	if len(inos) == 2 && inos[0] > inos[1] {
+		inos[0], inos[1] = inos[1], inos[0]
+	}
+	for i, ino := range inos {
+		if i > 0 && ino == inos[i-1] {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `SELECT 1 FROM inodes WHERE ino = $1 FOR UPDATE`, int64(ino)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// lockTree serializes operations that change the shape of the directory tree,
+// so that the check against moving a directory into its own subtree cannot
+// race with another move. It plays the role of the kernel's rename mutex.
+func (s *Store) lockTree(ctx context.Context, tx *sql.Tx) error {
+	if s.dialect != postgresDialect {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(pgTreeLockKey))
 	return err
 }
 
