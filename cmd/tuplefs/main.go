@@ -130,6 +130,9 @@ func mount(ctx context.Context, args []string) error {
 	if ok, err := st.Formatted(ctx); err != nil {
 		return err
 	} else if !ok {
+		if *readOnly {
+			return fmt.Errorf("%s holds no file system, and -ro cannot create one", redact(rest[0]))
+		}
 		if err := st.Format(ctx, store.DefaultBlockSize, uint32(os.Getuid()), uint32(os.Getgid()), 0o755); err != nil {
 			return err
 		}
@@ -142,11 +145,14 @@ func mount(ctx context.Context, args []string) error {
 		return err
 	}
 	// The only recovery there is: files unlinked while open when the last
-	// mount died. Everything else was committed or never happened.
-	if n, err := st.ReapOrphans(ctx); err != nil {
-		return err
-	} else if n > 0 {
-		log.Printf("reclaimed %d files that were deleted while open", n)
+	// mount died. Everything else was committed or never happened. A
+	// read-only mount leaves them for the next writable one.
+	if !*readOnly {
+		if n, err := st.ReapOrphans(ctx); err != nil {
+			return err
+		} else if n > 0 {
+			log.Printf("reclaimed %d files that were deleted while open", n)
+		}
 	}
 
 	server, err := fusefs.Mount(st, rest[1], fusefs.Options{AllowOther: *allowOther, ReadOnly: *readOnly, Debug: *debug})
@@ -164,6 +170,9 @@ func mount(ctx context.Context, args []string) error {
 		}
 	}()
 	server.Wait()
+	if *readOnly {
+		return nil
+	}
 	return st.Sync(ctx)
 }
 

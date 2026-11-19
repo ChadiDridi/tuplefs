@@ -15,7 +15,7 @@ It runs on SQLite (one file, no server) or PostgreSQL.
 
 ## Why
 
-Mike Stonebraker has argued for years that operating system services should be built on a database. In the [DBOS paper](https://www.vldb.org/pvldb/vol15/p21-skiadopoulos.pdf) (Skiadopoulos et al., PVLDB 15(1)) and again on The Peterman Pod, he makes the case for a file system written on top of a DBMS: transactions, recovery and high availability are solved once, in the database, and everything above gets them for free.
+Mike Stonebraker has argued for years that operating system services should be built on a database. In the [DBOS paper](https://www.vldb.org/pvldb/vol15/p21-skiadopoulos.pdf) (Skiadopoulos et al., PVLDB 15(1)) and again on [The Peterman Pod](https://www.developing.dev/i/194713116/1555-one-size-fits-none), he makes the case for a file system written on top of a DBMS: transactions, recovery and high availability are solved once, in the database, and everything above gets them for free.
 
 tuplefs is a small, working version of the file system half of that idea, so the claim can be tried instead of debated. It is an independent project, not affiliated with DBOS.
 
@@ -168,7 +168,7 @@ Measured with [bench/bench.sh](bench/bench.sh) on a laptop (Intel i7-1355U, NVMe
 | Read 5,000 files | 50,700 /s | 3,065 /s | 582 /s |
 | Delete 5,000 files | 77,112 /s | 1,041 /s | 264 /s |
 
-So on a single machine tuplefs on SQLite is roughly 10 to 75 times slower than ext4, and on PostgreSQL, where every statement also crosses a socket, slower again. Every request crosses from the kernel to a user-space process and becomes a SQL transaction, while ext4 runs in the kernel with its own page cache. The claim that a DBMS-backed file system can beat the Linux file system was made about a distributed, in-memory DBMS on a cluster; this project does not reproduce it and does not claim it.
+So on a single machine tuplefs on SQLite is roughly 10 to 75 times slower than ext4, and on PostgreSQL, where every statement also crosses a socket, slower again. Every request crosses from the kernel to a user-space process and becomes a SQL transaction, while ext4 runs in the kernel with its own page cache. This project does not reproduce the claim that a DBMS-backed file system beats the Linux file system. The DBOS paper measured a prototype on VoltDB, a multi-node main-memory DBMS, with in-memory operations only, and calls its own ext4 comparison "apples-to-oranges": with 40 threads its writes matched or beat ext4, while ext4 reads were considerably faster. tuplefs is a different design (FUSE, a disk-based database, one machine), and the numbers above are what that design costs.
 
 Use tuplefs where the properties matter more than throughput: configuration and state you want transactional and queryable, a file tree you want replicated by your database, or as a readable reference for how a file system maps onto tables.
 
