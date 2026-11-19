@@ -142,22 +142,22 @@ jobs:
         run: |
           set -o pipefail
           go build -o /tmp/tuplefs ./cmd/tuplefs
-          sudo mkdir -p /bench/local /bench/mnt
+          sudo mkdir -p /mnt/bench/local /mnt/bench/mnt
           {
-            echo "kernel $(uname -r), $(nproc) CPUs, $(df -T /bench | tail -1 | awk '{print $2}')"
+            echo "kernel $(uname -r), $(nproc) CPUs, $(df -T /mnt/bench | tail -1 | awk '{print $2}')"
             echo "===== local directory"
-            sudo bench/bench.sh /bench/local
+            sudo bench/bench.sh /mnt/bench/local
             for layout in db files; do
-              sudo rm -rf /bench/fs.db*
-              sudo /tmp/tuplefs mkfs -data $layout /bench/fs.db >/dev/null
-              sudo sh -c '/tmp/tuplefs mount /bench/fs.db /bench/mnt 2>/tmp/mount.log &'
-              for i in $(seq 1 50); do sudo mountpoint -q /bench/mnt && break; sleep 0.2; done
+              sudo rm -rf /mnt/bench/fs.db*
+              sudo /tmp/tuplefs mkfs -data $layout /mnt/bench/fs.db >/dev/null
+              sudo sh -c '/tmp/tuplefs mount /mnt/bench/fs.db /mnt/bench/mnt 2>/tmp/mount.log &'
+              for i in $(seq 1 50); do sudo mountpoint -q /mnt/bench/mnt && break; sleep 0.2; done
               # Refuse to measure anything that is not a tuplefs mount.
-              sudo findmnt -n -o FSTYPE /bench/mnt | grep -qx fuse.tuplefs || { cat /tmp/mount.log; exit 1; }
+              sudo findmnt -n -o FSTYPE /mnt/bench/mnt | grep -qx fuse.tuplefs || { cat /tmp/mount.log; exit 1; }
               echo "===== tuplefs on SQLite, data in $layout, mounted as root"
-              sudo bench/bench.sh /bench/mnt
-              sudo fusermount3 -u /bench/mnt; sleep 3
-              sudo /tmp/tuplefs fsck /bench/fs.db
+              sudo bench/bench.sh /mnt/bench/mnt
+              sudo fusermount3 -u /mnt/bench/mnt; sleep 3
+              sudo /tmp/tuplefs fsck /mnt/bench/fs.db
             done
           } 2>&1 | tee /tmp/bench.txt
           { echo '```'; cat /tmp/bench.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
